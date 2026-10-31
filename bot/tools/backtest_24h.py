@@ -257,7 +257,11 @@ def main() -> None:
             curve = bonding_curve(mint)
             return {"sig": c["sig"], "t": c["t"], "mint": mint, "curve": curve,
                     **candles(curve, c["t"], args.hold_minutes + 1)}
-        coins.append(cached(f"coins/{c['sig']}.json", fetch_coin))
+        try:
+            coins.append(cached(f"coins/{c['sig']}.json", fetch_coin))
+        except RuntimeError as e:
+            # Every endpoint refused this one; leave it out rather than stop.
+            print(f"   skipped {c['sig'][:12]}: {e}")
         if i % 25 == 0:
             print(f"   {i}/{len(sample)}")
 
