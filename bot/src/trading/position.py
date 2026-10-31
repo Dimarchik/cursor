@@ -37,7 +37,8 @@ class Position:
     stop_loss_price: float | None = None
     max_hold_time: int | None = None  # seconds
 
-    # recover_and_hold: quote spent on the position and quote won back so far
+    # recover_and_hold: quote paid for the tokens at the fill price (fees are
+    # covered by recover_buffer) and quote won back so far
     cost_quote: float = 0.0
     recovered_quote: float = 0.0
 

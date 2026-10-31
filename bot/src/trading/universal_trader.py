@@ -857,8 +857,6 @@ class UniversalTrader:
             stop_loss_percentage=self.stop_loss_percentage,
             max_hold_time=self.max_hold_time,
         )
-        # The cost to win back is what left the wallet, fee included.
-        position.cost_quote = max(position.cost_quote, self.buy_amount)
         quote_label = quote_symbol(normalize_quote_mint(token_info.quote_mint))
         logger.info(f"Created position: {position}")
         logger.info(
