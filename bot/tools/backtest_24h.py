@@ -34,7 +34,14 @@ from pathlib import Path
 
 from solders.pubkey import Pubkey
 
-RPC = "https://api.mainnet-beta.solana.com"
+# Tried in turn when one rate-limits; all serve getTransaction and history.
+RPCS = [
+    "https://api.mainnet-beta.solana.com",
+    "https://solana-rpc.publicnode.com",
+    "https://api.mainnet.solana.com",
+    "https://solana.publicnode.com",
+]
+RPC = RPCS[0]
 GECKO = "https://api.geckoterminal.com/api/v2"
 PUMP_PROGRAM = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
 MINT_AUTHORITY = "TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM"
@@ -71,14 +78,23 @@ def http_json(url: str, payload: dict | None = None, retries: int = 6) -> dict:
     raise RuntimeError(f"giving up on {url}")
 
 
-def rpc(method: str, params: list, retries: int = 6) -> dict:
-    """Call the RPC, retrying the public node's transient storage errors."""
+def rpc(method: str, params: list, retries: int = 8) -> dict:
+    """Call the RPC, moving to the next endpoint on an error or rate limit."""
+    body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    error = None
     for attempt in range(retries):
-        out = http_json(RPC, {"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+        url = RPCS[attempt % len(RPCS)]
+        try:
+            out = http_json(url, body, retries=1)
+        except (urllib.error.HTTPError, RuntimeError) as e:
+            error = e
+            time.sleep(0.5 * (attempt // len(RPCS) + 1))
+            continue
         if "error" not in out:
             return out["result"]
-        time.sleep(2 ** attempt)
-    raise RuntimeError(f"{method}: {out['error']}")
+        error = out["error"]
+        time.sleep(0.5 * (attempt // len(RPCS) + 1))
+    raise RuntimeError(f"{method}: {error}")
 
 
 def cached(name: str, fetch):  # noqa: ANN001, ANN201
