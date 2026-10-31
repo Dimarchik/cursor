@@ -1,0 +1,369 @@
+"""System-level Solana addresses and constants shared across platforms.
+
+Platform-specific addresses live in the respective AddressProvider.
+"""
+
+from collections.abc import Awaitable, Callable
+from typing import Any, Final
+
+from solders.pubkey import Pubkey
+
+# Constants
+LAMPORTS_PER_SOL: Final[int] = 1_000_000_000
+TOKEN_DECIMALS: Final[int] = 6
+
+# Token account constants
+TOKEN_ACCOUNT_SIZE: Final[int] = 165  # Size of a token account in bytes
+TOKEN_ACCOUNT_RENT_EXEMPT_RESERVE: Final[int] = (
+    2_039_280  # Rent-exempt minimum for token accounts
+)
+
+# Core system programs
+SYSTEM_PROGRAM: Final[Pubkey] = Pubkey.from_string("11111111111111111111111111111111")
+TOKEN_PROGRAM: Final[Pubkey] = Pubkey.from_string(
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+)
+TOKEN_2022_PROGRAM: Final[Pubkey] = Pubkey.from_string(
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+)
+ASSOCIATED_TOKEN_PROGRAM: Final[Pubkey] = Pubkey.from_string(
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+)
+
+# System accounts
+RENT: Final[Pubkey] = Pubkey.from_string("SysvarRent111111111111111111111111111111111")
+
+# Native SOL token
+SOL_MINT: Final[Pubkey] = Pubkey.from_string(
+    "So11111111111111111111111111111111111111112"
+)
+
+# Quote mints supported by pump.fun's v2 trade instructions.
+# `bonding_curve.quote_mint` is Pubkey::default() (all zeros) for SOL-paired
+# coins; the v2 instructions still expect wrapped SOL to be passed explicitly.
+# Doc: pump-public-docs README, "New Bonding Curve Trade Instructions".
+DEFAULT_PUBKEY: Final[Pubkey] = Pubkey.from_string("11111111111111111111111111111111")
+WSOL_MINT: Final[Pubkey] = SOL_MINT
+USDC_MINT: Final[Pubkey] = Pubkey.from_string(
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+)
+
+# Decimals per quote mint. SOL uses 9, USDC uses 6.
+QUOTE_DECIMALS: Final[dict[Pubkey, int]] = {
+    WSOL_MINT: 9,
+    USDC_MINT: 6,
+}
+
+# Token program that owns each quote mint. WSOL and USDC are legacy SPL Token,
+# but the v2 instructions take quote_token_program separately from
+# base_token_program, so keep them decoupled. create_v2 can pair a coin with a
+# Token-2022 quote mint (error 6064 accepts "SPL Token or Token-2022"), so this
+# map is not exhaustive -- see resolve_quote_token_program for mints outside it.
+QUOTE_TOKEN_PROGRAMS: Final[dict[Pubkey, Pubkey]] = {
+    WSOL_MINT: TOKEN_PROGRAM,
+    USDC_MINT: TOKEN_PROGRAM,
+}
+
+
+# Byte offset of `decimals` in a Mint account. SPL Token and Token-2022 share the
+# same base layout -- COption<Pubkey> mint_authority (4-byte tag + 32-byte
+# pubkey), u64 supply, then u8 decimals at byte 44. Token-2022 extensions are
+# appended after the 82-byte base struct, never rearranging it.
+_MINT_DECIMALS_OFFSET: Final[int] = 44
+
+
+def _parse_mint_decimals(data: bytes) -> int:
+    """Read the `decimals` field out of a raw Mint account's byte layout.
+
+    Args:
+        data: Raw account data, e.g. `.data` on the solders `Account` from
+            `SolanaClient.get_account_info`
+
+    Returns:
+        The mint's decimal count
+
+    Raises:
+        ValueError: If the data is too short to be a Mint account
+    """
+    if len(data) <= _MINT_DECIMALS_OFFSET:
+        raise ValueError(
+            f"Account data is only {len(data)} bytes, too short to be a "
+            f"Mint account (decimals lives at byte {_MINT_DECIMALS_OFFSET})"
+        )
+    return data[_MINT_DECIMALS_OFFSET]
+
+
+# Process-lifetime cache of quote mint -> decimals. Pre-seeded from
+# QUOTE_DECIMALS so WSOL/USDC never cost an RPC call; every other entry is added
+# by resolve_quote_token_program off the same mint-account fetch.
+_QUOTE_DECIMALS_CACHE: dict[Pubkey, int] = dict(QUOTE_DECIMALS)
+
+
+def quote_decimals(quote_mint: Pubkey) -> int:
+    """Get a quote mint's decimal count from the warm cache -- zero RPC.
+
+    Pre-seeded with WSOL (9) and USDC (6); every other quote mint is cached by
+    `resolve_quote_token_program`, which every configured mint goes through at
+    startup.
+
+    Raises rather than guessing. `QuoteControl` admits mints at 6, 8 and 9
+    decimals, so a default would misprice the coin and inflate the slippage cap
+    in the same direction, compounding into an overspend instead of cancelling.
+    Callers that must not fail on an unknown mint use `cached_quote_units`.
+
+    Returns:
+        Number of decimals used by the quote mint
+
+    Raises:
+        ValueError: If the mint's decimals have not been resolved yet
+    """
+    decimals = _QUOTE_DECIMALS_CACHE.get(quote_mint)
+    if decimals is None:
+        raise ValueError(
+            f"Decimals for quote mint {quote_mint} are unknown. Call "
+            f"resolve_quote_token_program() for it before pricing or sizing a "
+            f"trade -- guessing here misprices the trade by a power of ten."
+        )
+    return decimals
+
+
+def quote_units_per_token(quote_mint: Pubkey) -> int:
+    """Get the raw-units-per-whole-unit factor for a quote mint.
+
+    Returns:
+        10 ** decimals for the quote mint (1e9 for SOL, 1e6 for USDC)
+
+    Raises:
+        ValueError: If the mint's decimals have not been resolved yet
+    """
+    return 10 ** quote_decimals(quote_mint)
+
+
+def cached_quote_units(quote_mint: Pubkey) -> int | None:
+    """Get the raw-units-per-whole-unit factor, or None if it is unknown.
+
+    For callers that decode a coin they may never trade -- a curve decoder runs
+    against every coin a listener reports, and raising there would turn an
+    unknown quote asset into a decode failure that a retry loop keeps retrying.
+    Anything that sizes or prices a real trade uses `quote_units_per_token` and
+    takes the raise.
+
+    Returns:
+        10 ** decimals for the quote mint, or None if unresolved
+    """
+    decimals = _QUOTE_DECIMALS_CACHE.get(quote_mint)
+    return None if decimals is None else 10**decimals
+
+
+def quote_token_program(quote_mint: Pubkey) -> Pubkey:
+    """Get the token program owning a quote mint, defaulting to SPL Token.
+
+    Returns:
+        Token program id for the quote mint
+    """
+    return QUOTE_TOKEN_PROGRAMS.get(quote_mint, TOKEN_PROGRAM)
+
+
+# Process-lifetime cache of quote mint -> owning token program. Pre-seeded from
+# QUOTE_TOKEN_PROGRAMS so WSOL/USDC never cost an RPC call; every other entry is
+# added by resolve_quote_token_program at startup, so the hot path
+# (cached_quote_token_program) never makes a chain read.
+_QUOTE_TOKEN_PROGRAM_CACHE: dict[Pubkey, Pubkey] = dict(QUOTE_TOKEN_PROGRAMS)
+
+
+async def resolve_quote_token_program(
+    quote_mint: Pubkey,
+    get_account_info: Callable[[Pubkey], Awaitable[Any]],
+) -> Pubkey:
+    """Resolve and cache the token program *and* decimals for a quote mint.
+
+    Returns with no RPC call for a mint already in QUOTE_TOKEN_PROGRAMS or
+    resolved earlier in this process. Otherwise fetches the mint account once and
+    caches both facts: the account's owner *is* the token program, and its data
+    carries `decimals` at a fixed offset (see `_parse_mint_decimals`).
+
+    Worst case is one RPC call, so callers on a zero-RPC hot path must not call
+    it directly; read `cached_quote_token_program` / `quote_decimals` once this
+    has warmed the caches.
+
+    Args:
+        quote_mint: Quote mint address to resolve
+        get_account_info: Async getter returning an account object with
+            `.owner` (Pubkey) and `.data` (bytes) attributes, e.g.
+            `SolanaClient.get_account_info`
+
+    Returns:
+        Token program id that owns the quote mint
+
+    Raises:
+        ValueError: If the mint's owner is neither SPL Token nor Token-2022, or
+            its account data is too short to carry a decimals field. Meant to go
+            uncaught at startup: trading a quote mint the bot cannot size is
+            worse than refusing to start.
+    """
+    # Both caches, not just the program one: a mint seeded into
+    # QUOTE_TOKEN_PROGRAMS but not QUOTE_DECIMALS would otherwise short-circuit
+    # here and never have its decimals read at all.
+    cached = _QUOTE_TOKEN_PROGRAM_CACHE.get(quote_mint)
+    if cached is not None and quote_mint in _QUOTE_DECIMALS_CACHE:
+        return cached
+
+    account = await get_account_info(quote_mint)
+    owner = account.owner
+    if owner not in (TOKEN_PROGRAM, TOKEN_2022_PROGRAM):
+        raise ValueError(
+            f"Quote mint {quote_mint} is owned by {owner}, expected "
+            f"{TOKEN_PROGRAM} (SPL Token) or {TOKEN_2022_PROGRAM} (Token-2022)"
+        )
+    decimals = _parse_mint_decimals(bytes(account.data))
+    _QUOTE_TOKEN_PROGRAM_CACHE[quote_mint] = owner
+    _QUOTE_DECIMALS_CACHE[quote_mint] = decimals
+    return owner
+
+
+def cached_quote_token_program(quote_mint: Pubkey) -> Pubkey:
+    """Read a quote mint's token program from the warm cache -- zero RPC.
+
+    An unresolved mint falls back to `quote_token_program`'s SPL Token default.
+    That is safe on the hot path: every configured quote mint is cached at
+    startup, so an uncached mint is one the bot skips before it reaches a buy.
+
+    Returns:
+        Cached token program id, or the SPL Token default if unresolved
+    """
+    return _QUOTE_TOKEN_PROGRAM_CACHE.get(quote_mint, quote_token_program(quote_mint))
+
+
+def normalize_quote_mint(quote_mint: Pubkey | None) -> Pubkey:
+    """Resolve a bonding curve's quote_mint into a concrete mint address.
+
+    SOL-paired coins carry Pubkey::default() on-chain but must be traded with
+    wrapped SOL passed as the quote mint.
+
+    Args:
+        quote_mint: Raw quote_mint from the bonding curve, or None
+
+    Returns:
+        Wrapped SOL for SOL-paired coins, otherwise the quote mint unchanged
+    """
+    if quote_mint is None or quote_mint == DEFAULT_PUBKEY:
+        return WSOL_MINT
+    return quote_mint
+
+
+# Friendly aliases accepted in bot YAML so configs don't need raw mints.
+QUOTE_MINT_ALIASES: Final[dict[str, Pubkey]] = {
+    "sol": WSOL_MINT,
+    "wsol": WSOL_MINT,
+    "usdc": USDC_MINT,
+}
+
+
+def resolve_quote_mint(value: str | Pubkey) -> Pubkey:
+    """Resolve a config value into a quote mint address.
+
+    Accepts the aliases "sol"/"wsol"/"usdc" or a raw base58 mint address.
+
+    Args:
+        value: Alias or mint address from configuration
+
+    Raises:
+        ValueError: If the value is neither a known alias nor a valid address
+    """
+    if isinstance(value, Pubkey):
+        return normalize_quote_mint(value)
+
+    alias = QUOTE_MINT_ALIASES.get(str(value).strip().lower())
+    if alias is not None:
+        return alias
+
+    try:
+        return normalize_quote_mint(Pubkey.from_string(str(value)))
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"Unknown quote mint {value!r}. Use one of "
+            f"{sorted(QUOTE_MINT_ALIASES)} or a base58 mint address."
+        ) from exc
+
+
+def resolve_quote_amounts(
+    amounts: dict[str, float] | None,
+) -> dict[Pubkey, float]:
+    """Resolve a config map of quote mint -> spend amount.
+
+    Args:
+        amounts: Mapping of alias/mint address to amount in whole quote units
+
+    Returns:
+        Mapping keyed by resolved Pubkey (empty if amounts is None)
+
+    Raises:
+        ValueError: If a key is not a valid quote mint or an amount is not positive
+    """
+    if not amounts:
+        return {}
+
+    resolved: dict[Pubkey, float] = {}
+    for key, amount in amounts.items():
+        mint = resolve_quote_mint(key)
+        if not isinstance(amount, int | float) or amount <= 0:
+            raise ValueError(
+                f"quote_amounts[{key!r}] must be a positive number, got {amount!r}"
+            )
+        resolved[mint] = float(amount)
+    return resolved
+
+
+def quote_symbol(quote_mint: Pubkey) -> str:
+    """Human-readable label for a quote mint, for logging only.
+
+    Returns:
+        "SOL" for wrapped SOL, otherwise a truncated mint address
+    """
+    if is_sol_paired(quote_mint):
+        return "SOL"
+    mint_str = str(quote_mint)
+    return f"{mint_str[:4]}..{mint_str[-4:]}"
+
+
+def is_sol_paired(quote_mint: Pubkey | None) -> bool:
+    """Check whether a coin is SOL-paired (native SOL transfers).
+
+    Args:
+        quote_mint: Raw or normalized quote mint
+
+    Returns:
+        True if the coin trades against native/wrapped SOL
+    """
+    return normalize_quote_mint(quote_mint) == WSOL_MINT
+
+
+class SystemAddresses:
+    """System-level Solana addresses shared across all platforms."""
+
+    # Reference the module-level constants
+    SYSTEM_PROGRAM = SYSTEM_PROGRAM
+    TOKEN_PROGRAM = TOKEN_PROGRAM
+    TOKEN_2022_PROGRAM = TOKEN_2022_PROGRAM
+    ASSOCIATED_TOKEN_PROGRAM = ASSOCIATED_TOKEN_PROGRAM
+    RENT = RENT
+    SOL_MINT = SOL_MINT
+    WSOL_MINT = WSOL_MINT
+    USDC_MINT = USDC_MINT
+    DEFAULT_PUBKEY = DEFAULT_PUBKEY
+
+    @classmethod
+    def get_all_system_addresses(cls) -> dict[str, Pubkey]:
+        """Get all system addresses as a dictionary.
+
+        Returns:
+            Dictionary mapping address names to Pubkey objects
+        """
+        return {
+            "system_program": cls.SYSTEM_PROGRAM,
+            "token_program": cls.TOKEN_PROGRAM,
+            "token_2022_program": cls.TOKEN_2022_PROGRAM,
+            "associated_token_program": cls.ASSOCIATED_TOKEN_PROGRAM,
+            "rent": cls.RENT,
+            "sol_mint": cls.SOL_MINT,
+        }

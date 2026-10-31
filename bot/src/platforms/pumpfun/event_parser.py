@@ -1,0 +1,988 @@
+"""Pump.fun EventParser: IDL-based parsing of token creation events."""
+
+import base64
+import struct
+from time import monotonic
+from typing import Any
+
+from solders.pubkey import Pubkey
+from solders.transaction import VersionedTransaction
+
+from core.pubkeys import (
+    SystemAddresses,
+    cached_quote_token_program,
+    normalize_quote_mint,
+)
+from interfaces.core import EventParser, Platform, TokenInfo
+from platforms.pumpfun.address_provider import PumpFunAddresses
+from utils.idl_parser import IDLParser
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+# Fields in a "Program <id> invoke [n]" / "Program <id> success" frame line.
+_FRAME_LOG_FIELDS = 3
+
+# Index of the optional `quote_mint` remaining account on create_v2. Accounts
+# 1-16 are in the IDL; 17-19 are optional remaining accounts appended only when
+# creating a coin with a non-native quote mint. See COIN_CREATION.md in the
+# pump-fun public docs repository.
+_CREATE_V2_QUOTE_MINT_ACCOUNT_INDEX = 16
+
+# Index of the `user` account, which differs per instruction version: create_v2
+# dropped the four metaplex accounts legacy `create` carries between the global
+# account and the user, so the same wallet sits four places earlier. Reading
+# create_v2's account 7 yields the token program instead.
+_CREATE_USER_ACCOUNT_INDEX = 7
+_CREATE_V2_USER_ACCOUNT_INDEX = 5
+
+# Length of a Solana public key in bytes.
+PUBKEY_BYTE_LENGTH = 32
+
+# The two log lines the pump.fun program writes when it creates a coin. They are
+# matched whole: Anchor writes `Instruction: <Name>` for every program, so a
+# substring test also accepts CreateTokenAccount, CreatePool,
+# CreateFeeSharingConfig and any other instruction whose name starts with
+# "Create", from any program sharing the transaction.
+CREATE_INSTRUCTION_LOGS = (
+    "Program log: Instruction: Create",
+    "Program log: Instruction: CreateV2",
+)
+
+
+def _option_bool(value: object) -> bool:
+    """Read an Anchor OptionBool argument.
+
+    OptionBool is a single-field struct with no presence tag, so the IDL parser
+    decodes it as {"field_0": bool}; a trailing argument the caller omitted
+    arrives as None. Omission is not ambiguity: create_v2's trailing arguments
+    are positional, so a truncated instruction cannot have set a later one, and
+    reporting it unset is correct rather than a guess.
+
+    Args:
+        value: Decoded argument, a dict, a bool, or None when absent
+
+    Returns:
+        The flag's value, False when the argument was not sent
+    """
+    if isinstance(value, dict):
+        return bool(value.get("field_0", False))
+    return bool(value) if value is not None else False
+
+
+def _coerce_pubkey(value: object) -> Pubkey | None:
+    """Coerce a decoded IDL pubkey field into a Pubkey.
+
+    Args:
+        value: Decoded field, which may be a str, Pubkey, bytes or None
+
+    Returns:
+        Pubkey, or None if the value cannot be interpreted
+    """
+    if value is None:
+        return None
+    if isinstance(value, Pubkey):
+        return value
+    if isinstance(value, str):
+        try:
+            return Pubkey.from_string(value)
+        except (ValueError, TypeError):
+            return None
+    if isinstance(value, bytes | bytearray) and len(value) == PUBKEY_BYTE_LENGTH:
+        return Pubkey.from_bytes(bytes(value))
+    return None
+
+
+class PumpFunEventParser(EventParser):
+    """Pump.Fun implementation of EventParser interface with IDL-based event parsing."""
+
+    def __init__(self, idl_parser: IDLParser):
+        """Initialize pump.fun event parser with injected IDL parser.
+
+        Args:
+            idl_parser: Pre-loaded IDL parser for pump.fun platform
+        """
+        self._idl_parser = idl_parser
+
+        event_discriminators = self._idl_parser.get_event_discriminators()
+        self._create_event_discriminator_bytes = event_discriminators["CreateEvent"]
+        self._create_event_discriminator = struct.unpack(
+            "<Q", self._create_event_discriminator_bytes
+        )[0]
+
+        # A coin with creator-fee sharing has its BondingCurve.creator rewritten
+        # in the same transaction that creates it, and this event reports the
+        # value written. Absent from older IDLs, hence the get().
+        self._migrate_creator_discriminator_bytes = event_discriminators.get(
+            "MigrateBondingCurveCreatorEvent"
+        )
+
+        instruction_discriminators = self._idl_parser.get_instruction_discriminators()
+        self._create_instruction_discriminator_bytes = instruction_discriminators[
+            "create"
+        ]
+        self._create_instruction_discriminator = struct.unpack(
+            "<Q", self._create_instruction_discriminator_bytes
+        )[0]
+
+        # Support for token2022 (create_v2 instruction)
+        self._create_v2_instruction_discriminator_bytes = (
+            instruction_discriminators.get("create_v2")
+        )
+        self._create_v2_instruction_discriminator = (
+            struct.unpack("<Q", self._create_v2_instruction_discriminator_bytes)[0]
+            if self._create_v2_instruction_discriminator_bytes
+            else None
+        )
+
+        logger.info(
+            "Pump.Fun event parser initialized with IDL-based event and instruction parsing"
+        )
+        logger.info(
+            f"CreateEvent discriminator: {self._create_event_discriminator_bytes.hex()}"
+        )
+        logger.info(
+            f"create instruction discriminator: {self._create_instruction_discriminator_bytes.hex()}"
+        )
+        if self._create_v2_instruction_discriminator_bytes:
+            logger.info(
+                f"create_v2 instruction discriminator: {self._create_v2_instruction_discriminator_bytes.hex()}"
+            )
+
+    @property
+    def platform(self) -> Platform:
+        """Get the platform this parser serves."""
+        return Platform.PUMP_FUN
+
+    def parse_token_creation_from_logs(
+        self, logs: list[str], signature: str
+    ) -> TokenInfo | None:
+        """Parse token creation from pump.fun transaction logs using IDL event parsing.
+
+        Args:
+            logs: List of log strings from transaction
+            signature: Transaction signature
+
+        Returns:
+            TokenInfo if token creation found, None otherwise
+        """
+        # Check if this is a token creation transaction (create, or create_v2
+        # for token2022)
+        if not any(log in CREATE_INSTRUCTION_LOGS for log in logs):
+            return None
+
+        logger.info(f"🔍 Parsing token creation from logs for signature: {signature}")
+
+        # Look for event data in the logs (CreateEvent data!)
+        # We need to find the Program data that comes after "Instruction: Create"
+        try:
+            create_instruction_found = False
+            program_data_entries = []
+            from_program = self._emitted_by_program(logs)
+
+            # First, collect all Program data entries and note when Create instruction happens
+            for i, log in enumerate(logs):
+                if log in CREATE_INSTRUCTION_LOGS:
+                    create_instruction_found = True
+                    instruction_type = log.rsplit(": ", 1)[1]
+                    logger.info(
+                        f"📝 Found {instruction_type} instruction at log index {i}"
+                    )
+                elif "Program data:" in log:
+                    # A CreateEvent another program emitted is not pump.fun
+                    # saying a coin exists; trading on one buys a mint that was
+                    # never created.
+                    if from_program is not None and not from_program[i]:
+                        continue
+                    # Extract base64 encoded event data
+                    encoded_data = log.split("Program data: ")[1].strip()
+                    program_data_entries.append((i, encoded_data, log))
+                    logger.info(
+                        f"📊 Found Program data at log index {i}, length: {len(encoded_data)}"
+                    )
+
+            if not create_instruction_found:
+                logger.info("❌ No Create or CreateV2 instruction found in logs")
+                return None
+
+            if not program_data_entries:
+                logger.info("❌ No Program data entries found in logs")
+                return None
+
+            logger.info(
+                f"🔍 Found {len(program_data_entries)} Program data entries to check"
+            )
+
+            # Try each Program data entry
+            for entry_idx, (log_idx, encoded_data, full_log) in enumerate(
+                program_data_entries
+            ):
+                try:
+                    logger.info(
+                        f"🧪 Trying Program data entry {entry_idx + 1}/{len(program_data_entries)} (log index {log_idx})"
+                    )
+
+                    decoded_data = base64.b64decode(encoded_data)
+
+                    if len(decoded_data) < 8:
+                        logger.info(
+                            f"⚠️ Program data too short: {len(decoded_data)} bytes"
+                        )
+                        continue
+
+                    # Check discriminator from program data
+                    discriminator = decoded_data[:8]
+                    discriminator_int = struct.unpack("<Q", discriminator)[0]
+
+                    logger.info(
+                        f"🔍 Program data discriminator: {discriminator.hex()} (int: {discriminator_int})"
+                    )
+                    logger.info(
+                        f"🎯 Expected CreateEvent discriminator: {self._create_event_discriminator_bytes.hex()} (int: {self._create_event_discriminator})"
+                    )
+
+                    # Try to decode as CreateEvent using IDL parser
+                    decoded_event = self._idl_parser.decode_event_data(
+                        decoded_data, "CreateEvent"
+                    )
+
+                    if not decoded_event:
+                        logger.info("❌ IDL parser returned None for CreateEvent")
+                        continue
+
+                    if decoded_event.get("event_name") != "CreateEvent":
+                        logger.info(
+                            f"❌ Wrong event type: {decoded_event.get('event_name', 'None')}"
+                        )
+                        continue
+
+                    logger.info(
+                        f"✅ Successfully decoded event: {decoded_event.get('event_name', 'Unknown')}"
+                    )
+                    logger.info(
+                        f"🔍 Event fields: {list(decoded_event.get('fields', {}).keys())}"
+                    )
+
+                    fields = decoded_event.get("fields", {})
+                    if not fields:
+                        logger.info("❌ No fields found in decoded event")
+                        continue
+
+                    # Validate required fields exist
+                    required_fields = [
+                        "mint",
+                        "bonding_curve",
+                        "user",
+                        "creator",
+                        "name",
+                        "symbol",
+                        "uri",
+                    ]
+                    missing_fields = [
+                        field for field in required_fields if field not in fields
+                    ]
+                    if missing_fields:
+                        logger.info(f"❌ Missing required fields: {missing_fields}")
+                        continue
+
+                    logger.info(
+                        f"🎯 Token found: {fields.get('symbol', 'Unknown')} ({fields.get('name', 'Unknown')})"
+                    )
+
+                    # Convert string representations to Pubkey objects
+                    # Note: IDL parser returns pubkeys as base58 strings
+                    try:
+                        mint = (
+                            Pubkey.from_string(fields["mint"])
+                            if isinstance(fields["mint"], str)
+                            else fields["mint"]
+                        )
+                        bonding_curve = (
+                            Pubkey.from_string(fields["bonding_curve"])
+                            if isinstance(fields["bonding_curve"], str)
+                            else fields["bonding_curve"]
+                        )
+                        user = (
+                            Pubkey.from_string(fields["user"])
+                            if isinstance(fields["user"], str)
+                            else fields["user"]
+                        )
+                        creator = (
+                            Pubkey.from_string(fields["creator"])
+                            if isinstance(fields["creator"], str)
+                            else fields["creator"]
+                        )
+
+                        logger.info(f"🔑 Mint: {mint}")
+                        logger.info(f"🔑 Bonding Curve: {bonding_curve}")
+                        logger.info(f"🔑 User: {user}")
+                        logger.info(f"🔑 Creator: {creator}")
+
+                    except Exception as e:
+                        logger.info(f"❌ Failed to convert pubkey fields: {e}")
+                        continue
+
+                    # Derive additional addresses (default to TOKEN_2022_PROGRAM as per pump.fun's migration to create_v2)
+                    # Note: As of recent pump.fun updates, all tokens are created via create_v2 instruction
+                    # This is a technical limitation of logs listener - cannot distinguish create vs create_v2
+                    # Risk is low since pump.fun now defaults to Token2022 for all new tokens
+                    token_program_id = SystemAddresses.TOKEN_2022_PROGRAM
+                    associated_bonding_curve = self._derive_associated_bonding_curve(
+                        mint, bonding_curve, token_program_id
+                    )
+                    creator = self._creator_after_migration(logs, mint, creator)
+                    creator_vault = self._derive_creator_vault(creator)
+
+                    logger.info(
+                        f"✅ Successfully parsed CreateEvent for token: {fields.get('symbol', 'Unknown')}"
+                    )
+
+                    # CreateEvent gained quote_mint and virtual_quote_reserves
+                    # when pump.fun added non-SOL quote assets. Carry them on
+                    # TokenInfo so extreme_fast_mode — which skips the curve
+                    # fetch — still knows which quote asset to trade against.
+                    quote_mint = normalize_quote_mint(
+                        _coerce_pubkey(fields.get("quote_mint"))
+                    )
+
+                    # The event's creator is canonical, unlike instruction
+                    # args.creator, so extreme_fast_mode can trade on it without
+                    # a curve read. Old-format events missing the trailing fields
+                    # stay conservative.
+                    state_from_event = (
+                        "quote_mint" in fields and "is_mayhem_mode" in fields
+                    )
+
+                    return TokenInfo(
+                        name=fields["name"],
+                        symbol=fields["symbol"],
+                        uri=fields["uri"],
+                        mint=mint,
+                        platform=Platform.PUMP_FUN,
+                        bonding_curve=bonding_curve,
+                        associated_bonding_curve=associated_bonding_curve,
+                        user=user,
+                        creator=creator,
+                        creator_vault=creator_vault,
+                        token_program_id=token_program_id,
+                        is_mayhem_mode=fields.get("is_mayhem_mode", False),
+                        is_cashback_coin=fields.get("is_cashback_enabled", False),
+                        is_holder_reward=bool(fields.get("is_holder_reward", False)),
+                        creator_fee_bps=int(fields.get("creator_fee_bps", 0) or 0),
+                        quote_mint=quote_mint,
+                        quote_token_program_id=cached_quote_token_program(quote_mint),
+                        virtual_quote_reserves=fields.get("virtual_quote_reserves"),
+                        state_from_event=state_from_event,
+                        creation_timestamp=monotonic(),
+                    )
+
+                except Exception as e:
+                    logger.info(
+                        f"❌ Failed to decode Program data entry {entry_idx + 1}: {e}"
+                    )
+                    continue
+
+            logger.info("❌ No valid CreateEvent found in any Program data entries")
+            return None
+
+        except Exception:
+            logger.exception("Failed to parse token creation from logs")
+            return None
+
+    def _emitted_by_program(self, logs: list[str]) -> list[bool] | None:
+        """Flag, per log line, whether pump.fun's own invocation emitted it.
+
+        `Program data:` names no program, so without this any program sharing
+        the transaction can emit a payload the parsers below will read.
+
+        Returns:
+            One bool per log line, or None when the logs carry no invocation
+            frames at all — a reconstructed log list rather than an RPC's, for
+            which there is nothing to attribute by and the callers keep their
+            previous behaviour. A real notification always carries frames.
+        """
+        emitters = self._emitting_program(logs)
+        if not any(emitters):
+            return None
+        program_id = str(self.get_program_id())
+        return [emitter == program_id for emitter in emitters]
+
+    @staticmethod
+    def _emitting_program(logs: list[str]) -> list[str | None]:
+        """Map each log line to the program id whose invocation emitted it.
+
+        The runtime brackets every invocation with `Program <id> invoke [depth]`
+        and a matching `Program <id> success` or `... failed`, so a stack over
+        those lines attributes the lines between them. A line emitted outside
+        any invocation, which should not happen, maps to None.
+
+        Args:
+            logs: The transaction's log lines, in order
+
+        Returns:
+            One entry per log line: the program id that emitted it, or None
+        """
+        emitters: list[str | None] = []
+        stack: list[str] = []
+        for log in logs:
+            # "Program <id> invoke [n]" / "Program <id> success" — three
+            # fields before anything a frame line carries.
+            parts = log.split(" ")
+            is_frame = len(parts) >= _FRAME_LOG_FIELDS and parts[0] == "Program"
+            if is_frame and parts[2].startswith("invoke"):
+                stack.append(parts[1])
+                emitters.append(None)
+                continue
+            if is_frame and parts[2] in ("success", "failed"):
+                emitters.append(None)
+                if stack:
+                    stack.pop()
+                continue
+            emitters.append(stack[-1] if stack else None)
+        return emitters
+
+    def _creator_after_migration(
+        self,
+        logs: list[str],
+        mint: Pubkey,
+        creator: Pubkey,
+    ) -> Pubkey:
+        """Return the creator the bonding curve ends the transaction holding.
+
+        CreateEvent.creator is the wallet that submitted the create, which is
+        what BondingCurve.creator holds for an ordinary coin. A coin with
+        creator-fee sharing is different: the same transaction goes on to call
+        `migrate_bonding_curve_creator`, which overwrites the curve's creator
+        with the sharing-config PDA. This has nothing to do with graduation —
+        the `migrate`/`migrate_v2` instructions that move a completed curve to
+        PumpSwap — it rewrites one field on a curve that has just been created.
+        `buy_v2` derives `creator_vault` from `bonding_curve.creator`, so
+        building the buy from the CreateEvent value derives the wrong vault and
+        the transaction reverts with `ConstraintSeeds` (2006).
+
+        The rewrite announces the value it wrote, in the same log set the
+        CreateEvent came from, so no RPC call is needed to find it and
+        extreme_fast_mode keeps its zero-RPC path. A coin whose creator is
+        rewritten in a *later* transaction is not covered: the launch logs
+        cannot carry an event that has not happened yet, and the buy reverts
+        the same way.
+
+        Only a payload pump.fun itself emitted is considered. `Program data:`
+        carries no program of its own, and any program sharing the transaction
+        can emit eight bytes that match this discriminator; honouring one would
+        let a launcher pick the creator the bot builds its buy from and make
+        every sniper's transaction revert.
+
+        Args:
+            logs: The transaction's log lines, in order
+            mint: Mint of the coin the CreateEvent described, to ignore a
+                migration belonging to a different coin in the same transaction
+            creator: Creator the CreateEvent reported
+
+        Returns:
+            The migrated creator, or `creator` unchanged when the transaction
+            carries no migration for this mint.
+        """
+        if not self._migrate_creator_discriminator_bytes:
+            return creator
+
+        from_program = self._emitted_by_program(logs)
+
+        for index, log in enumerate(logs):
+            if "Program data:" not in log:
+                continue
+            if from_program is not None and not from_program[index]:
+                continue
+
+            try:
+                decoded_data = base64.b64decode(log.split("Program data: ")[1].strip())
+            except (ValueError, TypeError) as e:
+                logger.debug(f"Skipping an undecodable Program data entry: {e}")
+                continue
+
+            if not decoded_data.startswith(self._migrate_creator_discriminator_bytes):
+                continue
+
+            decoded_event = self._idl_parser.decode_event_data(
+                decoded_data, "MigrateBondingCurveCreatorEvent"
+            )
+            if not decoded_event:
+                continue
+
+            fields = decoded_event.get("fields", {})
+            event_mint = _coerce_pubkey(fields.get("mint"))
+            new_creator = _coerce_pubkey(fields.get("new_creator"))
+            if event_mint != mint or new_creator is None:
+                continue
+
+            logger.info(f"🔁 Bonding curve creator migrated to: {new_creator}")
+            return new_creator
+
+        return creator
+
+    def parse_token_creation_from_instruction(
+        self, instruction_data: bytes, accounts: list[int], account_keys: list[bytes]
+    ) -> TokenInfo | None:
+        """Parse token creation from pump.fun instruction data using injected IDL parser.
+
+        Args:
+            instruction_data: Raw instruction data
+            accounts: List of account indices
+            account_keys: List of account public keys
+
+        Returns:
+            TokenInfo if token creation found, None otherwise
+        """
+        # Determine which create instruction (standard or v2 for token2022)
+        is_create_v2 = False
+        if instruction_data.startswith(self._create_instruction_discriminator_bytes):
+            is_create_v2 = False
+        elif (
+            self._create_v2_instruction_discriminator_bytes
+            and instruction_data.startswith(
+                self._create_v2_instruction_discriminator_bytes
+            )
+        ):
+            is_create_v2 = True
+        else:
+            return None
+
+        try:
+            # Helper to get account key
+            def get_account_key(index):
+                if index >= len(accounts):
+                    return None
+                account_index = accounts[index]
+                if account_index >= len(account_keys):
+                    return None
+                return Pubkey.from_bytes(account_keys[account_index])
+
+            # Parse instruction data using injected IDL parser
+            decoded = self._idl_parser.decode_instruction(
+                instruction_data, account_keys, accounts
+            )
+            expected_instruction_name = "create_v2" if is_create_v2 else "create"
+            if not decoded or decoded["instruction_name"] != expected_instruction_name:
+                return None
+
+            args = decoded.get("args", {})
+
+            # Extract account information based on IDL account order. `user`
+            # sits at a different index per instruction version: create_v2
+            # dropped the four metaplex accounts legacy `create` carries, so
+            # its account 7 is the token program, not the launcher's wallet.
+            mint = get_account_key(0)
+            bonding_curve = get_account_key(2)
+            associated_bonding_curve = get_account_key(3)
+            user = get_account_key(
+                _CREATE_V2_USER_ACCOUNT_INDEX
+                if is_create_v2
+                else _CREATE_USER_ACCOUNT_INDEX
+            )
+
+            if not all([mint, bonding_curve, associated_bonding_curve, user]):
+                return None
+
+            # Holder-reward flag first: it decides where the creator comes from.
+            # Safe to trust from instruction args even though `creator` is not —
+            # the program rejects the request when the feature is globally off.
+            # The args are positional, so a truncated form cannot have set this
+            # and reads as False, correct by construction.
+            is_holder_reward = _option_bool(args.get("is_holder_reward"))
+
+            # On a holder-reward coin the program ignores args.creator and
+            # writes its own per-coin PDA into BondingCurve.creator, so
+            # creator_vault must derive from that instead. args.creator is
+            # otherwise copied to the curve verbatim at create time.
+            if is_holder_reward:
+                creator = PumpFunAddresses.find_holder_reward_creator(mint)
+            else:
+                creator = _coerce_pubkey(args.get("creator")) or user
+            creator_vault = self._derive_creator_vault(creator)
+
+            # Determine token program based on instruction type
+            token_program_id = (
+                SystemAddresses.TOKEN_2022_PROGRAM
+                if is_create_v2
+                else SystemAddresses.TOKEN_PROGRAM
+            )
+
+            # create_v2 rejects a new true here with 6082 CashbackDeprecated,
+            # but older instructions still carry it and existing cashback coins
+            # still trade, so it is still decoded.
+            is_cashback = _option_bool(args.get("is_cashback_enabled"))
+
+            # `creator_fee_bps` stays at TokenInfo's default rather than being
+            # decoded from args: upstream ignores it on SOL- and USDC-paired
+            # coins, so a non-zero arg would not reflect the actual fee. The
+            # CreateEvent path above takes it from the on-chain event.
+
+            # create_v2 passes a non-native quote mint as optional remaining
+            # account 17 (index 16). Absent means the coin is SOL-paired.
+            quote_mint = normalize_quote_mint(
+                get_account_key(_CREATE_V2_QUOTE_MINT_ACCOUNT_INDEX)
+                if is_create_v2
+                else None
+            )
+
+            return TokenInfo(
+                name=args.get("name", ""),
+                symbol=args.get("symbol", ""),
+                uri=args.get("uri", ""),
+                mint=mint,
+                platform=Platform.PUMP_FUN,
+                bonding_curve=bonding_curve,
+                associated_bonding_curve=associated_bonding_curve,
+                user=user,
+                creator=creator,
+                creator_vault=creator_vault,
+                token_program_id=token_program_id,
+                is_mayhem_mode=bool(args.get("is_mayhem_mode", False)),
+                is_cashback_coin=is_cashback,
+                is_holder_reward=bool(is_holder_reward),
+                quote_mint=quote_mint,
+                quote_token_program_id=cached_quote_token_program(quote_mint),
+                creation_timestamp=monotonic(),
+            )
+
+        except Exception as e:
+            logger.debug(f"Failed to parse create instruction: {e}")
+            return None
+
+    def parse_token_creation_from_geyser(
+        self, transaction_info: Any
+    ) -> TokenInfo | None:
+        """Parse token creation from Geyser transaction data.
+
+        Args:
+            transaction_info: Geyser transaction information
+
+        Returns:
+            TokenInfo if token creation found, None otherwise
+        """
+        try:
+            if not hasattr(transaction_info, "transaction"):
+                return None
+
+            # Prefer the CreateEvent from meta.log_messages: it carries the
+            # canonical creator plus mayhem/cashback/quote_mint, which marks the
+            # TokenInfo state_from_event so extreme_fast_mode buys with zero RPC
+            # calls. Fall back to instruction decoding when logs are absent.
+            tx_info = transaction_info.transaction.transaction
+            meta = getattr(tx_info, "meta", None)
+            log_messages = list(getattr(meta, "log_messages", []) or [])
+            if log_messages:
+                token_info = self.parse_token_creation_from_logs(
+                    log_messages, signature=""
+                )
+                if token_info:
+                    return token_info
+
+            tx = tx_info.transaction
+            msg = getattr(tx, "message", None)
+            if msg is None:
+                return None
+
+            for ix in msg.instructions:
+                # Skip non-pump.fun program instructions
+                program_idx = ix.program_id_index
+                if program_idx >= len(msg.account_keys):
+                    continue
+
+                program_id = msg.account_keys[program_idx]
+                if bytes(program_id) != bytes(self.get_program_id()):
+                    continue
+
+                token_info = self.parse_token_creation_from_instruction(
+                    ix.data, ix.accounts, msg.account_keys
+                )
+                if token_info:
+                    return token_info
+
+            return None
+
+        except Exception as e:
+            logger.debug(f"Failed to parse geyser transaction: {e}")
+            return None
+
+    def get_program_id(self) -> Pubkey:
+        """Get the pump.fun program ID this parser monitors.
+
+        Returns:
+            Pump.fun program ID
+        """
+        return PumpFunAddresses.PROGRAM
+
+    def get_creation_filter_accounts(self) -> list[Pubkey]:
+        """Subscribe on the mint authority rather than the whole program.
+
+        `mint_authority` (PDA ["mint-authority"], a constant) is account 1 of
+        both `create` and `create_v2`, and appears in no trade instruction --
+        buy_v2/sell_v2 never reference it. Filtering on it therefore yields
+        creations only, server-side, instead of every pump.fun transaction.
+
+        Returns:
+            The pump.fun mint authority
+        """
+        return [PumpFunAddresses.MINT_AUTHORITY]
+
+    def get_instruction_discriminators(self) -> list[bytes]:
+        """Get instruction discriminators for token creation.
+
+        Both creation instructions, newest first: `create_v2` is what pump.fun
+        issues now, and legacy `create` still appears. A caller uses these to
+        reject an instruction before paying for a full IDL decode, so leaving
+        `create_v2` out would make the gate reject every current coin.
+
+        Returns:
+            List of discriminator bytes to match
+        """
+        discriminators = []
+        if self._create_v2_instruction_discriminator_bytes:
+            discriminators.append(self._create_v2_instruction_discriminator_bytes)
+        discriminators.append(self._create_instruction_discriminator_bytes)
+        return discriminators
+
+    def get_event_discriminators(self) -> list[bytes]:
+        """Get event discriminators for token creation.
+
+        Returns:
+            List of event discriminator bytes to match
+        """
+        return [self._create_event_discriminator_bytes]
+
+    def parse_token_creation_from_block(self, block_data: dict) -> TokenInfo | None:
+        """Parse token creation from block data (for block listener).
+
+        Args:
+            block_data: Block data from WebSocket
+
+        Returns:
+            TokenInfo if token creation found, None otherwise
+        """
+        try:
+            if "transactions" not in block_data:
+                return None
+
+            for tx in block_data["transactions"]:
+                if not isinstance(tx, dict) or "transaction" not in tx:
+                    continue
+
+                # Prefer the CreateEvent from logs: args.creator on the
+                # instruction is user-supplied and may differ from the canonical
+                # BC.creator, so creator_vault derived from the event is the one
+                # that matches the program constraint.
+                meta = tx.get("meta")
+                if isinstance(meta, dict):
+                    logs = meta.get("logMessages") or meta.get("log_messages")
+                    if logs:
+                        token_info = self.parse_token_creation_from_logs(
+                            logs, signature=""
+                        )
+                        if token_info:
+                            return token_info
+
+                # Decode base64 transaction data if needed
+                tx_data = tx["transaction"]
+                if isinstance(tx_data, list) and len(tx_data) > 0:
+                    try:
+                        tx_data_encoded = tx_data[0]
+                        tx_data_decoded = base64.b64decode(tx_data_encoded)
+                        transaction = VersionedTransaction.from_bytes(tx_data_decoded)
+
+                        for ix in transaction.message.instructions:
+                            program_id = transaction.message.account_keys[
+                                ix.program_id_index
+                            ]
+
+                            # Check if instruction is from pump.fun program
+                            if str(program_id) != str(self.get_program_id()):
+                                continue
+
+                            ix_data = bytes(ix.data)
+
+                            # Check for create or create_v2 discriminator
+                            if len(ix_data) >= 8:
+                                discriminator = struct.unpack("<Q", ix_data[:8])[0]
+
+                                is_create = (
+                                    discriminator
+                                    == self._create_instruction_discriminator
+                                )
+                                is_create_v2 = (
+                                    self._create_v2_instruction_discriminator
+                                    and discriminator
+                                    == self._create_v2_instruction_discriminator
+                                )
+
+                                if is_create or is_create_v2:
+                                    # Token creation should have substantial data and many accounts
+                                    if len(ix_data) <= 8 or len(ix.accounts) < 10:
+                                        continue
+
+                                    account_keys_bytes = [
+                                        bytes(key)
+                                        for key in transaction.message.account_keys
+                                    ]
+
+                                    # Parse the instruction
+                                    token_info = (
+                                        self.parse_token_creation_from_instruction(
+                                            ix_data, ix.accounts, account_keys_bytes
+                                        )
+                                    )
+                                    if token_info:
+                                        return token_info
+
+                    except Exception as e:
+                        logger.debug(f"Failed to parse block transaction: {e}")
+                        continue
+
+                # Handle already decoded transaction data
+                elif isinstance(tx_data, dict) and "message" in tx_data:
+                    try:
+                        message = tx_data["message"]
+                        if (
+                            "instructions" not in message
+                            or "accountKeys" not in message
+                        ):
+                            continue
+
+                        for ix in message["instructions"]:
+                            if (
+                                "programIdIndex" not in ix
+                                or "accounts" not in ix
+                                or "data" not in ix
+                            ):
+                                continue
+
+                            program_idx = ix["programIdIndex"]
+                            if program_idx >= len(message["accountKeys"]):
+                                continue
+
+                            program_id_str = message["accountKeys"][program_idx]
+                            if program_id_str != str(self.get_program_id()):
+                                continue
+
+                            # Decode instruction data
+                            ix_data = base64.b64decode(ix["data"])
+
+                            if len(ix_data) >= 8:
+                                discriminator = struct.unpack("<Q", ix_data[:8])[0]
+
+                                is_create = (
+                                    discriminator
+                                    == self._create_instruction_discriminator
+                                )
+                                is_create_v2 = (
+                                    self._create_v2_instruction_discriminator
+                                    and discriminator
+                                    == self._create_v2_instruction_discriminator
+                                )
+
+                                if is_create or is_create_v2:
+                                    if len(ix_data) <= 8 or len(ix["accounts"]) < 10:
+                                        continue
+
+                                    # Convert account keys to bytes for parsing
+                                    account_keys_bytes = [
+                                        Pubkey.from_string(key).to_bytes()
+                                        for key in message["accountKeys"]
+                                    ]
+
+                                    token_info = (
+                                        self.parse_token_creation_from_instruction(
+                                            ix_data, ix["accounts"], account_keys_bytes
+                                        )
+                                    )
+                                    if token_info:
+                                        return token_info
+
+                    except Exception as e:
+                        logger.debug(f"Failed to parse decoded block transaction: {e}")
+                        continue
+
+            return None
+
+        except Exception as e:
+            logger.debug(f"Failed to parse block data: {e}")
+            return None
+
+    def _derive_creator_vault(self, creator: Pubkey) -> Pubkey:
+        """Derive the creator vault for a creator."""
+        derived_address, _ = Pubkey.find_program_address(
+            [b"creator-vault", bytes(creator)],
+            PumpFunAddresses.PROGRAM,
+        )
+        return derived_address
+
+    def _derive_associated_bonding_curve(
+        self,
+        mint: Pubkey,
+        bonding_curve: Pubkey,
+        token_program_id: Pubkey | None = None,
+    ) -> Pubkey:
+        """Derive the associated bonding curve (ATA of bonding curve for the token).
+
+        Args:
+            mint: Token mint address
+            token_program_id: Token program (TOKEN or TOKEN_2022). Defaults to TOKEN_PROGRAM
+        """
+        if token_program_id is None:
+            token_program_id = SystemAddresses.TOKEN_PROGRAM
+
+        derived_address, _ = Pubkey.find_program_address(
+            [
+                bytes(bonding_curve),
+                bytes(token_program_id),
+                bytes(mint),
+            ],
+            SystemAddresses.ASSOCIATED_TOKEN_PROGRAM,
+        )
+        return derived_address
+
+    def _parse_bonding_curve_state(self, data: bytes) -> dict[str, Any] | None:
+        """Parse bonding curve state from raw account data using IDL parser.
+
+        Args:
+            data: Raw bonding curve account data
+
+        Returns:
+            Dictionary with parsed bonding curve state or None if parsing fails
+        """
+        try:
+            decoded = self._idl_parser.decode_account_data(
+                data, "BondingCurve", skip_discriminator=True
+            )
+            if not decoded:
+                return None
+            return decoded
+        except Exception as e:
+            logger.debug(f"Failed to parse bonding curve state: {e}")
+            return None
+
+    def _get_is_mayhem_mode_from_curve(self, bonding_curve_address: Pubkey) -> bool:
+        """Determine if a token is in mayhem mode based on bonding curve state.
+
+        Note: This would require an RPC call to fetch the bonding curve account.
+        For now, we return False as a default since the event parser doesn't have
+        access to an RPC client. The mayhem mode flag will be set by traders
+        when they fetch bonding curve state for other operations.
+
+        Returns:
+            True if mayhem mode, False otherwise (or if parsing fails)
+        """
+        # Since event parser doesn't have RPC client access, we cannot fetch
+        # and parse bonding curve state here. Mayhem mode will be set later
+        # when traders fetch the bonding curve state.
+        return False
+
+    @property
+    def verbose(self) -> bool:
+        """Check if verbose logging is enabled."""
+        return getattr(self, "_verbose", False)
+
+    @verbose.setter
+    def verbose(self, value: bool) -> None:
+        """Set verbose logging."""
+        self._verbose = value

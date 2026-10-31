@@ -1,0 +1,361 @@
+"""Universal blockSubscribe listener, platform-agnostic via the interfaces."""
+
+import asyncio
+import json
+from collections.abc import Awaitable, Callable
+
+import websockets
+
+from core.client import SolanaClient
+from interfaces.core import Platform, TokenInfo
+from monitoring.base_listener import BaseTokenListener, reraise_if_cancelled
+from platforms import get_platform_implementations, platform_factory
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+# Solana logsSubscribe / blockSubscribe frames routinely exceed the websockets
+# library's 1 MiB default, which closes the connection with code 1009
+# ("message too big"). Reconnecting recovers, but every dropped frame is a
+# missed token, so raise the ceiling instead of eating the disconnects.
+WEBSOCKET_MAX_MESSAGE_BYTES = 32 * 1024 * 1024
+
+
+class UniversalBlockListener(BaseTokenListener):
+    """Universal block listener that works with any platform."""
+
+    def __init__(
+        self,
+        wss_endpoint: str,
+        platforms: list[Platform] | None = None,
+    ) -> None:
+        """Initialize universal block listener.
+
+        Args:
+            wss_endpoint: WebSocket endpoint URL
+            platforms: List of platforms to monitor (if None, monitor all supported platforms)
+        """
+        super().__init__()
+        self.wss_endpoint = wss_endpoint
+        self.ping_interval = 20  # seconds
+
+        # Get supported platforms
+        if platforms is None:
+            # Monitor all supported platforms
+            self.platforms = platform_factory.get_supported_platforms()
+        else:
+            self.platforms = platforms
+
+        # Get event parsers for all platforms
+        self.platform_parsers = {}
+        # Accounts to subscribe on; a pump.fun parser names its program, a
+        # LaunchLab one its platform configs.
+        self.platform_program_ids = []
+        # (program id, platform, parser): a list, not a dict keyed by program,
+        # because several platforms can share one program.
+        self.program_id_to_parser = []
+
+        for platform in self.platforms:
+            try:
+                # Create a mock client class to avoid network operations
+                class DummyClient(SolanaClient):
+                    def __init__(self) -> None:
+                        # Skip SolanaClient.__init__ to avoid starting blockhash updater
+                        self.rpc_endpoint = "http://dummy"
+                        self._client = None
+                        self._cached_blockhash = None
+                        self._blockhash_lock = None
+                        self._blockhash_updater_task = None
+
+                dummy_client = DummyClient()
+
+                implementations = get_platform_implementations(platform, dummy_client)
+                parser = implementations.event_parser
+                self.platform_parsers[platform] = parser
+                program_id_str = str(parser.get_program_id())
+                self.platform_program_ids += [
+                    str(account) for account in parser.get_stream_filter_accounts()
+                ]
+                self.program_id_to_parser.append((program_id_str, platform, parser))
+
+                logger.info(
+                    f"Registered platform {platform.value} with program ID {parser.get_program_id()}"
+                )
+
+            except Exception as e:
+                logger.warning(f"Could not register platform {platform.value}: {e}")
+
+    async def listen_for_tokens(
+        self,
+        token_callback: Callable[[TokenInfo], Awaitable[None]],
+        match_string: str | None = None,
+        creator_address: str | None = None,
+    ) -> None:
+        """Listen for new token creations using blockSubscribe.
+
+        Args:
+            token_callback: Callback function for new tokens
+            match_string: Optional string to match in token name/symbol
+            creator_address: Optional creator address to filter by
+        """
+        if not self.platform_parsers:
+            logger.error("No platform parsers available. Cannot listen for tokens.")
+            return
+
+        while True:
+            try:
+                async with websockets.connect(
+                    self.wss_endpoint, max_size=WEBSOCKET_MAX_MESSAGE_BYTES
+                ) as websocket:
+                    await self._subscribe_to_programs(websocket)
+                    ping_task = asyncio.create_task(self._ping_loop(websocket))
+
+                    try:
+                        while True:
+                            token_info = await self._wait_for_token_creation(websocket)
+                            if not token_info:
+                                continue
+
+                            logger.info(
+                                f"New token detected: {token_info.name} ({token_info.symbol}) on {token_info.platform.value}"
+                            )
+
+                            # Apply filters
+                            if match_string and not (
+                                match_string.lower() in token_info.name.lower()
+                                or match_string.lower() in token_info.symbol.lower()
+                            ):
+                                logger.info(
+                                    f"Token does not match filter '{match_string}'. Skipping..."
+                                )
+                                continue
+
+                            if (
+                                creator_address
+                                and str(token_info.user) != creator_address
+                            ):
+                                logger.info(
+                                    f"Token not created by {creator_address}. Skipping..."
+                                )
+                                continue
+
+                            await token_callback(token_info)
+
+                    except websockets.exceptions.ConnectionClosed:
+                        logger.warning("WebSocket connection closed. Reconnecting...")
+                    finally:
+                        # Every exit from the read loop leaves this connection
+                        # behind, including read errors and cancellation. An
+                        # uncancelled ping loop would keep pinging a dead socket
+                        # for up to ping_interval and log a spurious "Ping error".
+                        ping_task.cancel()
+
+            except Exception:
+                logger.exception("WebSocket connection error")
+                logger.info("Reconnecting in 5 seconds...")
+                await asyncio.sleep(5)
+
+    async def _subscribe_to_programs(
+        self, websocket: websockets.WebSocketServerProtocol
+    ) -> None:
+        """Subscribe to blocks mentioning any of the monitored program IDs.
+
+        Args:
+            websocket: Active WebSocket connection
+        """
+        # For block subscriptions, we can use mentionsAccountOrProgram to monitor multiple programs
+        # We'll create separate subscriptions for each program to be more specific
+        for i, program_id in enumerate(self.platform_program_ids):
+            subscription_message = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": i + 1,
+                    "method": "blockSubscribe",
+                    "params": [
+                        {"mentionsAccountOrProgram": program_id},
+                        {
+                            "commitment": "confirmed",
+                            "encoding": "base64",
+                            "showRewards": False,
+                            "transactionDetails": "full",
+                            # Whole-frame setting: a version the subscription
+                            # does not accept does not skip that transaction,
+                            # it nulls `value.block` for the entire frame and
+                            # leaves this listener almost entirely blind.
+                            "maxSupportedTransactionVersion": 1,
+                        },
+                    ],
+                }
+            )
+
+            await websocket.send(subscription_message)
+            logger.info(f"Subscribed to blocks mentioning: {program_id}")
+
+    async def _ping_loop(self, websocket: websockets.WebSocketServerProtocol) -> None:
+        """Keep connection alive with pings.
+
+        Args:
+            websocket: Active WebSocket connection
+        """
+        try:
+            while True:
+                await asyncio.sleep(self.ping_interval)
+                try:
+                    pong_waiter = await websocket.ping()
+                    await asyncio.wait_for(pong_waiter, timeout=10)
+                except TimeoutError:
+                    logger.warning("Ping timeout - server not responding")
+                    # Force reconnection
+                    await websocket.close()
+                    return
+        except asyncio.CancelledError:
+            pass
+        except websockets.exceptions.ConnectionClosed:
+            # The connection going away is the expected end of a ping loop's
+            # life, not a failure. `ping()` raises ConnectionClosedOK on a clean
+            # 1000 close and ConnectionClosedError when no close frame comes
+            # back; both are normal shutdowns and neither is a CancelledError,
+            # so without this they reach the broad handler and print a traceback
+            # at ERROR on every good run.
+            logger.debug("Ping loop ending: the connection closed")
+        except Exception:
+            logger.exception("Ping error")
+
+    def _transactions_from_frame(self, data: dict) -> list | None:
+        """Pull the transaction list out of one blockSubscribe frame.
+
+        Args:
+            data: Decoded WebSocket frame
+
+        Returns:
+            The block's transactions, or None if the frame carries no block —
+            a subscription reply, an error, or a slot with no block at all
+        """
+        if "error" in data:
+            logger.error(f"Block subscription error: {data['error']}")
+            return None
+        if "result" in data:
+            # Subscription confirmation - continue waiting for notifications
+            return None
+
+        if data.get("method") != "blockNotification":
+            return None
+
+        result = data.get("params", {}).get("result", {})
+        # `block` is null for a skipped or unavailable slot — the key is
+        # present, the value is not. Without the null check the membership
+        # test below raises TypeError, the notification is dropped and the
+        # blocks listener quietly detects fewer coins than logs/geyser.
+        block = result.get("value", {}).get("block")
+        if not block or "transactions" not in block:
+            return None
+
+        return block["transactions"]
+
+    async def _wait_for_token_creation(
+        self, websocket: websockets.WebSocketServerProtocol
+    ) -> TokenInfo | None:
+        """Wait for token creation event from any platform.
+
+        Args:
+            websocket: Active WebSocket connection
+
+        Returns:
+            TokenInfo if a token creation is found, None otherwise
+        """
+        try:
+            response = await asyncio.wait_for(websocket.recv(), timeout=30)
+            transactions = self._transactions_from_frame(json.loads(response))
+            if transactions is None:
+                return None
+
+            # Process all transactions in the block for token creations
+            return self._process_block_transactions(transactions)
+
+        except TimeoutError:
+            logger.debug("No data received for 30 seconds")
+        except websockets.exceptions.ConnectionClosed:
+            logger.warning("WebSocket connection closed")
+            raise
+        except json.JSONDecodeError:
+            # One malformed frame is not worth dropping the connection over.
+            logger.warning("Discarding a frame that is not valid JSON")
+        except Exception:
+            # Order matters: a cancellation arriving mid-frame-assembly is
+            # reported as AssertionError, so it has to be recognised before
+            # the broad handler treats it as a per-message problem.
+            reraise_if_cancelled()
+            # Anything else here came from the read itself rather than from
+            # parsing one transaction, which is contained further down. The
+            # library's frame state may be corrupt, and re-reading a corrupt
+            # stream just repeats the same error forever — reconnect instead.
+            logger.exception("Error reading from the WebSocket; reconnecting")
+            raise
+
+        return None
+
+    def _process_block_transactions(self, transactions: list) -> TokenInfo | None:
+        """Process all transactions in a block looking for token creations.
+
+        Args:
+            transactions: List of transaction data from block
+
+        Returns:
+            TokenInfo if a token creation is found, None otherwise
+        """
+        for tx in transactions:
+            if not isinstance(tx, dict):
+                continue
+
+            # Skip failed txs — sniping a failed create yields a non-existent
+            # mint and the buy-side tx then fails with InvalidMint. The runtime
+            # keeps the logs a transaction emitted before it failed, so a create
+            # inside one that later reverted still leaves a CreateEvent here.
+            meta = tx.get("meta")
+            if isinstance(meta, dict) and meta.get("err") is not None:
+                continue
+
+            # The logs are the only route. A `create` reached by CPI lives in
+            # meta.innerInstructions, produced by execution, so it is absent
+            # from the envelope's top-level instructions however well those are
+            # decoded; the logs carry it at any depth because `emit!` fires at
+            # any depth. Both are fields of the same frame, so reading the logs
+            # costs no extra request. Opening an envelope is a separate
+            # exercise, done by cookbook/pumpfun/decode/.
+            token_info = self._parse_from_logs(tx)
+            if token_info:
+                return token_info
+
+        return None
+
+    def _parse_from_logs(self, tx: dict) -> TokenInfo | None:
+        """Dispatch one transaction to its platform parser using its logs.
+
+        Works for any transaction version, because the RPC has already decoded
+        the envelope by the time the logs are emitted.
+
+        Args:
+            tx: Transaction wrapper from block, including its `meta`
+
+        Returns:
+            TokenInfo if a token creation is found, None otherwise
+        """
+        meta = tx.get("meta")
+        if not isinstance(meta, dict):
+            return None
+
+        logs = meta.get("logMessages") or meta.get("log_messages")
+        if not logs:
+            return None
+
+        for program_id, _platform, parser in self.program_id_to_parser:
+            if not any(program_id in line for line in logs):
+                continue
+            # parse_token_creation_from_block contains its own failures and
+            # answers None, so a parser that cannot read this transaction just
+            # hands the next one its turn.
+            token_info = parser.parse_token_creation_from_block({"transactions": [tx]})
+            if token_info:
+                return token_info
+
+        return None

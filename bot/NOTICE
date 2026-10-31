@@ -1,0 +1,13 @@
+This directory is a modified copy of chainstacklabs/pumpfun-bonkfun-bot
+(https://github.com/chainstacklabs/pumpfun-bonkfun-bot), licensed under the
+Apache License 2.0 (see LICENSE). The upstream commit is in UPSTREAM_COMMIT.
+
+Modifications:
+- recover_and_hold exit strategy (src/trading/universal_trader.py,
+  src/trading/position.py, src/config_loader.py, src/bot_runner.py)
+- bots/bot-recover-and-hold.yaml
+- tools/moonbags.py
+- tests/regression/verify_recover_and_hold.py; exit_strategy set on the trader
+  stubs of three existing verifiers
+- README.md and docs/regression-tests.md sections for the above
+- bots/bot-sniper-1-geyser.yaml ships disabled
