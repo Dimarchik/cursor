@@ -42,16 +42,16 @@ trade:
 
   buy_amount: 0.005 # SOL на одну монету (~$0.5 при SOL ≈ $100)
   buy_slippage: 0.3
-  sell_slippage: 0.3
+  sell_slippage: 0.1
 
   exit_strategy: "recover_and_hold"
   recover_multiplier: 2.0 # при каком росте цены возвращать вложенное
-  recover_buffer: 0.05 # продать на 5% больше безубытка: комиссии pump.fun с обеих сторон, сеть, проскальзывание
+  recover_buffer: 0.1 # продать на 5% больше безубытка: комиссии pump.fun с обеих сторон, сеть, проскальзывание
   recover_timeout_action: "sell_all" # "sell_all" или "hold" — что делать, если за max_hold_time цели нет
-  max_hold_time: 1800 # секунд ждать цели (null — ждать бесконечно)
+  max_hold_time: 180 # секунд ждать цели; по данным за сутки 89% монет, дошедших до 2x, сделали это за 2 минуты
   stop_loss_percentage: null # например 0.5 — продать всё при падении на 50% до достижения цели
   max_open_positions: 50 # сколько монет одновременно ждут цели; новые пропускаются, пока места нет
-  price_check_interval: 2 # секунд между проверками цены каждой позиции
+  price_check_interval: 3 # секунд между проверками цены каждой позиции
   max_exit_sell_attempts: 3
 
   # false: бот покупает ровно на buy_amount SOL, сначала прочитав цену.

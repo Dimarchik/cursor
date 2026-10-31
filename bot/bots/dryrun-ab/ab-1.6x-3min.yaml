@@ -1,4 +1,4 @@
-# A/B dry run: цель 2x, проскальзывание продажи 10%.
+# A/B dry run: цель 1.6x (продаётся ~69%), ждать 3 минуты.
 # Запуск всех вариантов разом: uv run tools/run_dryrun_ab.py
 # Стратегия «вернуть вложенное и держать остаток» (recover_and_hold).
 #
@@ -13,7 +13,7 @@
 #   "sell_all" — продать всё и закрыть токен-аккаунт (вернётся депозит ~0.002 SOL)
 #   "hold"     — оставить всё как есть в холде
 
-name: "ab-2x-slip10"
+name: "ab-1.6x-3min"
 env_file: ".env"
 rpc_endpoint: "${SOLANA_NODE_RPC_ENDPOINT}"
 wss_endpoint: "${SOLANA_NODE_WSS_ENDPOINT}"
@@ -47,10 +47,10 @@ trade:
   sell_slippage: 0.1
 
   exit_strategy: "recover_and_hold"
-  recover_multiplier: 2.0 # при каком росте цены возвращать вложенное
+  recover_multiplier: 1.6 # при каком росте цены возвращать вложенное
   recover_buffer: 0.1 # продать на 5% больше безубытка: комиссии pump.fun с обеих сторон, сеть, проскальзывание
   recover_timeout_action: "sell_all" # "sell_all" или "hold" — что делать, если за max_hold_time цели нет
-  max_hold_time: 1800 # секунд ждать цели (null — ждать бесконечно)
+  max_hold_time: 180 # секунд ждать цели; по данным за сутки 89% монет, дошедших до 2x, сделали это за 2 минуты
   stop_loss_percentage: null # например 0.5 — продать всё при падении на 50% до достижения цели
   max_open_positions: 50 # сколько монет одновременно ждут цели; новые пропускаются, пока места нет
   price_check_interval: 3 # секунд между проверками цены каждой позиции
