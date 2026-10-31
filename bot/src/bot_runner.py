@@ -171,6 +171,7 @@ async def start_bot(config_path: str):
             bro_address=cfg["filters"].get("bro_address"),
             marry_mode=cfg["filters"].get("marry_mode", False),
             yolo_mode=cfg["filters"].get("yolo_mode", False),
+            mayhem_only=cfg["filters"].get("mayhem_only", False),
             # Compute unit configuration
             compute_units=cfg.get("compute_units", {}),
             # Node provider configuration

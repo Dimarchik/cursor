@@ -35,6 +35,7 @@ individual scripts for a subset.
 | `verify_tp_sl_exit_price.py` | the tp/sl exit prices off the trigger price, and a reverted sell is retried, bounded |
 | `verify_time_based_exit_retry.py` | the default `time_based` exit retries a reverted sell instead of stranding the position |
 | `verify_duplicate_token_events.py` | a creation the listener reports twice is bought once, and its age counts from the first report |
+| `verify_mayhem_filter.py` | `filters.mayhem_only` skips non-Mayhem coins with a reason and lets Mayhem coins through |
 | `verify_dry_run_exchange.py` | a dry-run trade is priced on the curve as it stands when it lands, pays fee, network fee and rent, reverts past its slippage guard like a live one, and a dropped transaction is free and resendable |
 | `verify_recover_and_hold.py` | `recover_and_hold` sells back only the cost at the target, holds the rest out of cleanup's reach, sells everything on a stop loss or a `sell_all` timeout, and keeps open positions as held on shutdown |
 | `verify_time_exit_without_price.py` | `max_hold_time` still fires when every price read fails |

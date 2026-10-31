@@ -136,7 +136,7 @@ def market_features(coin: dict) -> dict:
     rows = [c for c in coin["ohlcv"] if c[0] >= coin["t"] - 60]
     if not rows:
         return {"m1_volume": 0.0, "m1_change": None}
-    o, _, _, _, c, v = rows[0][:6]
+    _, o, _, _, c, v = rows[0][:6]
     return {"m1_volume": v, "m1_change": c / o if o else None}
 
 
