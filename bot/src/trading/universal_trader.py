@@ -24,6 +24,7 @@ from core.pubkeys import (
     normalize_quote_mint,
     quote_decimals,
     quote_symbol,
+    quote_units_per_token,
     resolve_quote_amounts,
     resolve_quote_mint,
     resolve_quote_token_program,
@@ -215,6 +216,10 @@ class UniversalTrader:
         marry_mode: bool = False,
         yolo_mode: bool = False,
         mayhem_only: bool = False,
+        observe_seconds: float | None = None,
+        observe_min_inflow_sol: float = 0.0,
+        observe_min_price_ratio: float = 0.0,
+        observe_max_price_ratio: float | None = None,
         # Compute unit configuration
         compute_units: dict | None = None,
         # Node provider configuration
@@ -381,6 +386,16 @@ class UniversalTrader:
         # doubled within 30 min of a one-minute-late entry 26% of the time,
         # the rest 3%.
         self.mayhem_only = mayhem_only
+        # Watch a new coin's curve this long before buying, and buy only if at
+        # least `observe_min_inflow_sol` came in and the price moved within
+        # [min, max] ratio. Each watch runs on its own, so the queue keeps
+        # moving while coins are watched.
+        self.observe_seconds = observe_seconds
+        self.observe_min_inflow_sol = observe_min_inflow_sol
+        self.observe_min_price_ratio = observe_min_price_ratio
+        self.observe_max_price_ratio = observe_max_price_ratio
+        self._watching: dict[asyncio.Task, str] = {}  # task -> "watching" | "buying"
+        self._observed: dict[str, dict] = {}
 
         # State tracking
         self.traded_mints: set[Pubkey] = set()
@@ -743,15 +758,22 @@ class UniversalTrader:
                 return
             token_quote_mint = normalize_quote_mint(token_info.quote_mint)
 
+            watching = getattr(self, "_watching", {})
             if (
                 self.exit_strategy == "recover_and_hold"
-                and len(self._open_positions) >= self.max_open_positions
+                and len(self._open_positions) + len(watching) >= self.max_open_positions
             ):
                 logger.info(
                     f"Skipping {token_info.symbol} - {len(self._open_positions)} "
-                    f"positions already waiting for their target "
-                    f"(max_open_positions {self.max_open_positions})"
+                    f"positions waiting for their target and {len(watching)} "
+                    f"coins being watched (max_open_positions {self.max_open_positions})"
                 )
+                return
+
+            if getattr(self, "observe_seconds", None):
+                task = asyncio.create_task(self._observe_then_buy(token_info))
+                self._watching[task] = "watching"
+                task.add_done_callback(lambda t: self._watching.pop(t, None))
                 return
 
             # Wait for pool/curve to stabilize (unless in extreme fast mode)
@@ -784,6 +806,94 @@ class UniversalTrader:
 
         except Exception:
             logger.exception(f"Error handling token {token_info.symbol}")
+
+    async def _observe_then_buy(self, token_info: TokenInfo) -> None:
+        """Watch a coin for `observe_seconds`, then buy it if its demand qualifies."""
+        try:
+            reason = await self._observe(token_info)
+            if reason is not None:
+                logger.info(
+                    f"Skipping {token_info.symbol} after watching it "
+                    f"{self.observe_seconds}s - {reason}"
+                )
+                return
+            self._watching[asyncio.current_task()] = "buying"
+            logger.info(f"Buying {token_info.symbol} after watching it")
+            buy_result: TradeResult = await self.buyer.execute(token_info)
+            if buy_result.success:
+                await self._handle_successful_buy(token_info, buy_result)
+            else:
+                await self._handle_failed_buy(token_info, buy_result)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(f"Error watching or buying {token_info.symbol}")
+
+    async def _observe(self, token_info: TokenInfo) -> str | None:
+        """Compare the curve at the start and end of the watch.
+
+        Returns:
+            Why the coin is not bought, or None to buy it
+        """
+        pool = self._get_pool_address(token_info)
+        manager = self.platform_implementations.curve_manager
+        start = None
+        for _ in range(3):
+            try:
+                start = await manager.get_pool_state(pool)
+                break
+            except ValueError:
+                # A curve created this slot may not be readable yet.
+                await asyncio.sleep(0.5)
+        if start is None or not start.get("price_per_token"):
+            return "curve unreadable at the start of the watch"
+        await asyncio.sleep(self.observe_seconds)
+        end = await manager.get_pool_state(pool)
+        if end.get("graduated") or not end.get("price_per_token"):
+            return "curve graduated or unreadable at the end of the watch"
+        unit = quote_units_per_token(normalize_quote_mint(token_info.quote_mint))
+        inflow = (end["real_sol_reserves"] - start["real_sol_reserves"]) / unit
+        ratio = end["price_per_token"] / start["price_per_token"]
+        observation = {
+            "observe_seconds": self.observe_seconds,
+            "inflow_sol": round(inflow, 6),
+            "price_ratio": round(ratio, 4),
+            "sol_in_curve": round(end["real_sol_reserves"] / unit, 6),
+        }
+        reason = None
+        if inflow < self.observe_min_inflow_sol:
+            reason = f"only {inflow:.4f} SOL came in"
+        elif ratio < self.observe_min_price_ratio:
+            reason = f"price moved {ratio:.2f}x"
+        elif self.observe_max_price_ratio and ratio > self.observe_max_price_ratio:
+            reason = f"price already up {ratio:.2f}x"
+        observation["bought"] = reason is None
+        self._observed[str(token_info.mint)] = observation
+        if self.dry_run:
+            self._record_observation(token_info, observation)
+        return reason
+
+    def _record_observation(self, token_info: TokenInfo, observation: dict) -> None:
+        """Append a watch and its decision to `<trades_dir>/observations.jsonl`.
+
+        Skipped coins are recorded too, so their later prices can show whether
+        the filter skipped the right ones.
+        """
+        line = {
+            "t": round(datetime.utcnow().timestamp(), 1),
+            "mint": str(token_info.mint),
+            "symbol": token_info.symbol,
+            "is_mayhem_mode": token_info.is_mayhem_mode,
+            **observation,
+        }
+        try:
+            self.trades_dir.mkdir(parents=True, exist_ok=True)
+            with (self.trades_dir / "observations.jsonl").open(
+                "a", encoding="utf-8"
+            ) as f:
+                f.write(json.dumps(line) + "\n")
+        except OSError:
+            logger.exception("Failed to record observation")
 
     async def _handle_successful_buy(
         self, token_info: TokenInfo, buy_result: TradeResult
@@ -918,6 +1028,15 @@ class UniversalTrader:
         Runs before post-session cleanup, which closes the accounts of every
         traded mint and, with `force_close_with_burn`, burns what they hold.
         """
+        # Watches still deciding are dropped; a buy already sent is let land so
+        # its position is recorded rather than lost.
+        watching = getattr(self, "_watching", {})
+        for task, phase in list(watching.items()):
+            if phase == "watching":
+                task.cancel()
+        buying = [t for t, phase in watching.items() if phase == "buying"]
+        if buying:
+            await asyncio.wait(buying, timeout=30)
         if getattr(self, "_price_poller", None) is not None:
             self._price_poller.cancel()
         # Snapshot first: a cancelled monitor drops its entry on the way out.
@@ -1179,6 +1298,7 @@ class UniversalTrader:
             ),
             "entry_price": buy_result.price,
             "tokens": buy_result.amount,
+            **getattr(self, "_observed", {}).get(mint, {}),
         }
         try:
             state = await self.platform_implementations.curve_manager.get_pool_state(
