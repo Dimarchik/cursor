@@ -1101,11 +1101,12 @@ class UniversalTrader:
         """
         decode = self.platform_implementations.curve_manager.decode_pool_state
         while True:
-            pools = [
-                self._get_pool_address(info)
+            open_now = [
+                (info, position)
                 for info, position in list(self._open_positions.values())
                 if position.is_active and info.mint not in self._graduated_mints
             ]
+            pools = [self._get_pool_address(info) for info, _ in open_now]
             for i in range(0, len(pools), 100):
                 chunk = pools[i : i + 100]
                 try:
@@ -1126,7 +1127,40 @@ class UniversalTrader:
                         self._price_cache[pool] = (price, now)
                     else:
                         self._price_cache.pop(pool, None)
+            if self.dry_run:
+                self._record_price_path(open_now)
             await asyncio.sleep(self.price_check_interval)
+
+    def _record_price_path(self, open_now: list[tuple[TokenInfo, Position]]) -> None:
+        """Append each open position's price / entry to `<trades_dir>/prices.jsonl`.
+
+        A dry run's record of how coins move second by second after entry, at
+        the polling interval, for timing exits; minute candles cannot show it.
+        """
+        stamp = datetime.utcnow().timestamp()
+        lines = []
+        for info, position in open_now:
+            hit = self._price_cache.get(self._get_pool_address(info))
+            if hit and position.entry_price > 0:
+                held_s = (datetime.utcnow() - position.entry_time).total_seconds()
+                lines.append(
+                    json.dumps(
+                        {
+                            "t": round(stamp, 1),
+                            "mint": str(info.mint),
+                            "held_s": round(held_s, 1),
+                            "x": hit[0] / position.entry_price,
+                        }
+                    )
+                )
+        if not lines:
+            return
+        try:
+            self.trades_dir.mkdir(parents=True, exist_ok=True)
+            with (self.trades_dir / "prices.jsonl").open("a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except OSError:
+            logger.exception("Failed to record price path")
 
     async def _read_price(self, token_info: TokenInfo) -> float:
         """The coin's price where it trades now: its curve, or after graduation its AMM pool.
