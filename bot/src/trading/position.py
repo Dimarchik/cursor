@@ -37,6 +37,10 @@ class Position:
     stop_loss_price: float | None = None
     max_hold_time: int | None = None  # seconds
 
+    # recover_and_hold: quote spent on the position and quote won back so far
+    cost_quote: float = 0.0
+    recovered_quote: float = 0.0
+
     # Status
     is_active: bool = True
     exit_reason: ExitReason | None = None
@@ -85,6 +89,7 @@ class Position:
             take_profit_price=take_profit_price,
             stop_loss_price=stop_loss_price,
             max_hold_time=max_hold_time,
+            cost_quote=entry_price * quantity,
         )
 
     def should_exit(self, current_price: float) -> tuple[bool, ExitReason | None]:
@@ -112,13 +117,12 @@ class Position:
         return False, None
 
     def recover_quantity(self, current_price: float, buffer: float) -> float:
-        """Tokens to sell at `current_price` so the proceeds repay the entry cost.
+        """Tokens to sell at `current_price` so the proceeds repay what is still owed.
 
         Args:
             current_price: Price the sell is floored against, in the quote asset
             buffer: Extra fraction sold on top of the break-even amount to cover
-                the curve fee on both sides, network fees and slippage
-                (0.05 sells 5% more than `entry / current` of the position)
+                the curve fee, network fees and slippage (0.05 sells 5% more)
 
         Returns:
             Amount to sell, never more than `quantity`; all of it when the
@@ -126,8 +130,8 @@ class Position:
         """
         if current_price <= 0:
             return self.quantity
-        fraction = (self.entry_price / current_price) * (1 + buffer)
-        return self.quantity * min(1.0, fraction)
+        owed = max(0.0, self.cost_quote - self.recovered_quote)
+        return min(self.quantity, owed * (1 + buffer) / current_price)
 
     def should_exit_on_time(self) -> bool:
         """Check the one exit condition that needs no price.

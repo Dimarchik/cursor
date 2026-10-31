@@ -19,6 +19,9 @@ runs against a scripted price series and a stub seller:
   5. `max_hold_time` with `recover_timeout_action: hold` sells nothing and
      records the position as held; with `sell_all` it sells everything.
   6. The shipped bots/bot-recover-and-hold.yaml passes config validation.
+  8. A recovery sell that fills below its trigger (the price moved while it
+     landed) does not count as recovered: monitoring goes on, and the next
+     time the target is reached the shortfall is sold.
   7. In yolo mode the position is monitored in the background, so the caller
      returns at once; shutdown cancels the monitor and records the position as
      held instead of leaving it to cleanup.
@@ -71,20 +74,23 @@ class StubCurveManager:
 
 @dataclass
 class StubSeller:
-    """Records each sell and always succeeds."""
+    """Records each sell and always succeeds, filling at `fills[i]` x the ask."""
 
     sells: list[tuple[float, float]] = field(default_factory=list)
+    fills: list[float] = field(default_factory=list)
 
     async def execute(
         self, token_info: TokenInfo, token_amount: float, token_price: float
     ) -> TradeResult:
         self.sells.append((token_amount, token_price))
+        n = len(self.sells) - 1
+        fill = self.fills[n] if n < len(self.fills) else 1.0
         return TradeResult(
             success=True,
             platform=token_info.platform,
             tx_signature="stub-signature",
             amount=token_amount,
-            price=token_price,
+            price=token_price * fill,
         )
 
 
@@ -122,13 +128,14 @@ async def _run(
     prices: list[float],
     position: Position,
     timeout_action: str = "sell_all",
+    fills: list[float] | None = None,
 ) -> tuple[StubSeller, UniversalTrader, list[str], list[dict]]:
     """Drive the real monitor loop in a scratch directory.
 
     Returns:
         Seller stub, trader, mints cleanup was run for, moonbags.jsonl records
     """
-    seller = StubSeller()
+    seller = StubSeller(fills=fills or [])
     trader = object.__new__(UniversalTrader)
     trader.price_check_interval = 0
     trader.max_exit_sell_attempts = 3
@@ -301,6 +308,7 @@ async def check_background_monitor_and_shutdown() -> bool:
     trader.seller = seller
     trader.exit_strategy = "recover_and_hold"
     trader.recover_multiplier = MULTIPLIER
+    trader.buy_amount = ENTRY_PRICE * QUANTITY
     trader.recover_buffer = BUFFER
     trader.recover_timeout_action = "sell_all"
     trader.stop_loss_percentage = None
@@ -346,6 +354,33 @@ async def check_background_monitor_and_shutdown() -> bool:
     return ok
 
 
+async def check_short_fill_keeps_monitoring() -> bool:
+    print("\n8. A recovery sell filled below its trigger leaves the position open")
+    trigger = ENTRY_PRICE * 2.2
+    position = _make_position()
+    # The first sell fills 40% under its ask; the price then dips and recovers.
+    seller, _, _, bags = await _run(
+        [trigger, ENTRY_PRICE * 1.5, trigger], position, fills=[0.6, 1.0]
+    )
+    first, second = (seller.sells + [(0.0, 0.0), (0.0, 0.0)])[:2]
+    owed_after_first = ENTRY_PRICE * QUANTITY - first[0] * trigger * 0.6
+    expected_second = owed_after_first * (1 + BUFFER) / trigger
+    ok = _check("sold twice", len(seller.sells) == 2, f"{len(seller.sells)} sell(s)")
+    ok &= _check(
+        "second sell covers the shortfall",
+        abs(second[0] - expected_second) < TOLERANCE,
+        f"{second[0]:.2f} (expected {expected_second:.2f})",
+    )
+    ok &= _check(
+        "cost recovered before closing",
+        position.recovered_quote >= ENTRY_PRICE * QUANTITY * 0.999
+        and position.exit_reason is ExitReason.RECOVERED,
+        f"{position.recovered_quote:.6f} of {ENTRY_PRICE * QUANTITY:.6f}",
+    )
+    ok &= _check("held once recovered", len(bags) == 1, f"{len(bags)} record(s)")
+    return ok
+
+
 async def main() -> None:
     results = [
         check_recover_quantity(),
@@ -354,6 +389,7 @@ async def main() -> None:
         await check_timeout_actions(),
         check_shipped_config(),
         await check_background_monitor_and_shutdown(),
+        await check_short_fill_keeps_monitoring(),
     ]
     print(f"\n{'ALL PASSED' if all(results) else 'FAILED'}")
     sys.exit(0 if all(results) else 1)

@@ -857,6 +857,8 @@ class UniversalTrader:
             stop_loss_percentage=self.stop_loss_percentage,
             max_hold_time=self.max_hold_time,
         )
+        # The cost to win back is what left the wallet, fee included.
+        position.cost_quote = max(position.cost_quote, self.buy_amount)
         quote_label = quote_symbol(normalize_quote_mint(token_info.quote_mint))
         logger.info(f"Created position: {position}")
         logger.info(
@@ -1271,6 +1273,8 @@ class UniversalTrader:
                 f"{attempt} attempts. Position stays open "
                 f"and is no longer monitored - tokens are still held."
             )
+            if self.exit_strategy == "recover_and_hold":
+                self._record_bag(token_info, position, "gave_up", None)
             return True
         return False
 
@@ -1328,8 +1332,9 @@ class UniversalTrader:
                 sell_result.amount,
                 sell_result.tx_signature,
             )
-            self._close_recovered(token_info, position, sell_amount, price)
-            return ExitSellVerdict.SOLD
+            return self._book_recovery(
+                token_info, position, sell_amount, sell_result.price
+            )
 
         if sell_result.success:
             # Close position with actual exit price
@@ -1358,7 +1363,7 @@ class UniversalTrader:
         verdict = await self._classify_failed_exit_sell(token_info, sell_result)
         if verdict is ExitSellVerdict.LATE_SUCCESS and partial:
             logger.info(f"Recovery sell of {token_info.symbol} confirmed late")
-            self._close_recovered(token_info, position, sell_amount, price)
+            verdict = self._book_recovery(token_info, position, sell_amount, price)
         elif verdict is ExitSellVerdict.LATE_SUCCESS:
             # The sell landed, only its confirmation was late. Close against the
             # price it was floored at; the real fill was never read back.
@@ -1373,24 +1378,43 @@ class UniversalTrader:
             )
         return verdict
 
-    def _close_recovered(
+    def _book_recovery(
         self,
         token_info: TokenInfo,
         position: Position,
         sold: float,
         price: float,
-    ) -> None:
-        """Book a recovery sell: shrink the position, hold the rest, stop monitoring.
+    ) -> ExitSellVerdict:
+        """Book a recovery sell and decide whether the cost is won back.
 
-        No cleanup runs — the account still holds the remainder.
+        A fill below the trigger price (the price moved while the sell landed)
+        can leave part of the cost unpaid. Then monitoring continues and the
+        next time the target is reached the shortfall is sold.
+
+        Args:
+            price: Fill price per token after fees, in the quote asset
+
+        Returns:
+            SOLD when the cost is recovered and the rest is held, RETRY when
+            monitoring should go on
         """
         position.quantity -= sold
-        self._record_bag(token_info, position, "recovered", price)
-        position.close_position(price, ExitReason.RECOVERED)
-        logger.info(
-            f"Recovered cost of {token_info.symbol} at {price:.10f}; "
-            f"holding {position.quantity:.6f} tokens"
+        position.recovered_quote += sold * price
+        if position.recovered_quote >= position.cost_quote * 0.999:
+            self._record_bag(token_info, position, "recovered", price)
+            position.close_position(price, ExitReason.RECOVERED)
+            logger.info(
+                f"Recovered cost of {token_info.symbol} "
+                f"({position.recovered_quote:.6f} of {position.cost_quote:.6f}); "
+                f"holding {position.quantity:.6f} tokens"
+            )
+            return ExitSellVerdict.SOLD
+        logger.warning(
+            f"Recovery sell of {token_info.symbol} filled at {price:.10f}, "
+            f"short of the cost: {position.recovered_quote:.6f} of "
+            f"{position.cost_quote:.6f} back; still monitoring"
         )
+        return ExitSellVerdict.RETRY
 
     async def _cleanup_after_exit(self, token_info: TokenInfo) -> None:
         """Run the configured post-sell cleanup for a closed position.
