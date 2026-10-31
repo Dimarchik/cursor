@@ -247,8 +247,11 @@ class SolanaClient:
         """
         async with self._session_lock:
             if self._session is None or self._session.closed:
+                # trust_env honours HTTPS_PROXY/NO_PROXY like the solana-py
+                # client does, so both reach the RPC by the same route.
                 self._session = aiohttp.ClientSession(
                     timeout=aiohttp.ClientTimeout(total=10),
+                    trust_env=True,
                 )
             return self._session
 

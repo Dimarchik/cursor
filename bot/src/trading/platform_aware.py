@@ -26,6 +26,8 @@ from interfaces.core import (
 )
 from platforms import get_platform_implementations
 from trading.base import Trader, TradeResult
+from trading.dry_run import DryRunExchange
+from trading.dry_run import failure_reason as dry_run_failure_reason
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -120,6 +122,42 @@ def _refresh_quote_mint(token_info: TokenInfo, pool_state: dict) -> Pubkey:
     return quote_mint
 
 
+def _dry_run_result(
+    token_info: TokenInfo,
+    side: str,
+    *,
+    ok: bool,
+    amount: float,
+    price: float,
+    reason: str | None,
+) -> TradeResult:
+    """TradeResult for a simulated trade, shaped like the live one.
+
+    Args:
+        side: "buy" or "sell"
+        price: Per token in the quote asset; after fees for a sell
+        reason: Why the simulated transaction failed, when it did
+    """
+    if not ok:
+        logger.warning(f"[DRY RUN] {side} of {token_info.symbol} failed: {reason}")
+        return TradeResult(
+            success=False,
+            platform=token_info.platform,
+            error_message=f"[DRY RUN] {reason}",
+            failure_reason=dry_run_failure_reason(reason),
+        )
+    logger.info(
+        f"[DRY RUN] {side} {amount:.2f} {token_info.symbol} at {price:.10f} per token"
+    )
+    return TradeResult(
+        success=True,
+        platform=token_info.platform,
+        tx_signature=f"dryrun-{side}-{token_info.mint}",
+        amount=amount,
+        price=price,
+    )
+
+
 class PlatformAwareBuyer(Trader):
     """Platform-aware token buyer that works with any supported platform."""
 
@@ -138,6 +176,7 @@ class PlatformAwareBuyer(Trader):
         curve_refresh_budget: float = 2.0,
         *,
         trust_create_event: bool = True,
+        dry_run: DryRunExchange | None = None,
     ):
         """Initialize platform-aware token buyer.
 
@@ -162,6 +201,8 @@ class PlatformAwareBuyer(Trader):
                 state_from_event, so extreme_fast_mode makes zero RPC calls
                 between detection and submission. False forces the refresh for
                 every listener.
+            dry_run: Build the buy but settle it on this simulated exchange
+                instead of sending it.
         """
         self.client = client
         self.wallet = wallet
@@ -174,6 +215,7 @@ class PlatformAwareBuyer(Trader):
         self.compute_units = compute_units or {}
         self.curve_refresh_budget = curve_refresh_budget
         self.trust_create_event = trust_create_event
+        self.dry_run = dry_run
         # SOL-paired coins always use `amount`; other quotes need an explicit
         # per-mint amount because 0.0001 USDC and 0.0001 SOL are not comparable.
         self.quote_amounts: dict[Pubkey, float] = {
@@ -320,6 +362,22 @@ class PlatformAwareBuyer(Trader):
                 f"Total cost: {quote_amount:.6f} {quote_label} "
                 f"(max: {max_quote_amount_raw / quote_unit:.6f} {quote_label})"
             )
+
+            if self.dry_run is not None:
+                ok, tokens, price, reason = await self.dry_run.buy(
+                    token_info.mint,
+                    pool_address=self._get_pool_address(token_info, address_provider),
+                    curve_manager=curve_manager,
+                    token_amount_raw=token_amount_raw,
+                    max_cost_raw=max_quote_amount_raw,
+                    exact_in=getattr(
+                        instruction_builder, "spends_exact_amount_in", False
+                    ),
+                    quote_amount=quote_amount,
+                )
+                return _dry_run_result(
+                    token_info, "buy", ok=ok, amount=tokens, price=price, reason=reason
+                )
 
             tx_signature = await self.client.build_and_send_transaction(
                 instructions,
@@ -637,14 +695,22 @@ class PlatformAwareSeller(Trader):
         slippage: float = 0.25,
         max_retries: int = 5,
         compute_units: dict | None = None,
+        *,
+        dry_run: DryRunExchange | None = None,
     ):
-        """Initialize platform-aware token seller."""
+        """Initialize platform-aware token seller.
+
+        Args:
+            dry_run: Build the sell but settle it on this simulated exchange
+                instead of sending it.
+        """
         self.client = client
         self.wallet = wallet
         self.priority_fee_manager = priority_fee_manager
         self.slippage = slippage
         self.max_retries = max_retries
         self.compute_units = compute_units or {}
+        self.dry_run = dry_run
 
     async def execute(
         self, token_info: TokenInfo, token_amount: float, token_price: float
@@ -833,6 +899,40 @@ class PlatformAwareSeller(Trader):
             priority_accounts = seller.get_required_accounts_for_sell(
                 token_info, self.wallet.pubkey, address_provider
             )
+
+            if self.dry_run is not None:
+
+                async def read_state() -> tuple:
+                    if graduated:
+                        state = await seller.get_market_state(token_info)
+                        return ("price", state["price_per_token"])
+                    state = await curve_manager.get_pool_state(pool_address)
+                    if state.get("graduated"):
+                        state = await implementations.graduated_market.get_market_state(
+                            token_info
+                        )
+                        return ("price", state["price_per_token"])
+                    return (
+                        "curve",
+                        state["virtual_token_reserves"],
+                        state["virtual_sol_reserves"],
+                    )
+
+                ok, price, reason = await self.dry_run.sell(
+                    token_info.mint,
+                    read_state=read_state,
+                    token_amount_raw=token_balance,
+                    min_out_raw=min_quote_output,
+                    fee_fraction=fee_fraction,
+                )
+                return _dry_run_result(
+                    token_info,
+                    "sell",
+                    ok=ok,
+                    amount=token_balance_decimal,
+                    price=price,
+                    reason=reason,
+                )
 
             tx_signature = await self.client.build_and_send_transaction(
                 instructions,

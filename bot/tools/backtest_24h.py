@@ -65,7 +65,7 @@ def http_json(url: str, payload: dict | None = None, retries: int = 6) -> dict:
         except urllib.error.HTTPError as e:
             if e.code != 429 and e.code < 500:
                 raise
-        except (urllib.error.URLError, TimeoutError):
+        except (urllib.error.URLError, TimeoutError, OSError):
             pass
         time.sleep(2 ** attempt)
     raise RuntimeError(f"giving up on {url}")

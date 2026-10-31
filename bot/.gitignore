@@ -177,3 +177,4 @@ trades/trades.log
 # tools/backtest_24h.py raw cache; report.json is kept
 analysis_data/*
 !analysis_data/report.json
+trades_dryrun/

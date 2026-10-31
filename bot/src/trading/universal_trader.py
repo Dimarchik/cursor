@@ -8,6 +8,7 @@ from enum import Enum
 from pathlib import Path
 from time import monotonic
 
+from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 
 from cleanup.modes import (
@@ -37,6 +38,7 @@ from interfaces.core import (
 from monitoring.listener_factory import ListenerFactory
 from platforms import get_platform_implementations
 from trading.base import TradeResult
+from trading.dry_run import DryRunExchange
 from trading.platform_aware import PlatformAwareBuyer, PlatformAwareSeller
 from trading.position import ExitReason, Position
 from utils.logger import get_logger
@@ -137,6 +139,10 @@ class UniversalTrader:
     #: cover a session's worth of traded coins, not one.
     _CLEANUP_SHUTDOWN_BUDGET = 120.0
 
+    # Live trading writes to ./trades; a dry run swaps in its own directory.
+    dry_run = False
+    trades_dir = Path("trades")
+
     def __init__(
         self,
         rpc_endpoint: str,
@@ -174,6 +180,11 @@ class UniversalTrader:
         recover_buffer: float = 0.05,
         recover_timeout_action: str = "sell_all",
         max_open_positions: int = 10,
+        # Dry run: trade against live prices without sending transactions
+        dry_run: bool = False,
+        dry_run_balance: float = 0.2,
+        dry_run_latency: tuple[float, float] = (1.0, 2.5),
+        dry_run_drop_rate: float = 0.05,
         # Priority fee configuration
         enable_dynamic_priority_fee: bool = False,
         enable_fixed_priority_fee: bool = True,
@@ -204,7 +215,30 @@ class UniversalTrader:
         """Initialize the universal trader."""
         # Core components
         self.solana_client = SolanaClient(rpc_endpoint, max_rps=max_rps)
+        self.dry_run = dry_run
+        if dry_run and extreme_fast_mode:
+            # extreme_fast_mode buys a token count without reading the price,
+            # and a dry run has no fill to learn it from afterwards.
+            logger.warning("DRY RUN: extreme_fast_mode is off, the price is read first")
+            extreme_fast_mode = False
+        if dry_run and not private_key:
+            # Nothing is signed for the chain, so a throwaway key will do.
+            private_key = str(Keypair())
         self.wallet = Wallet(private_key)
+        self.dry_exchange = None
+        if dry_run:
+            self.trades_dir = Path("trades_dryrun")
+            self.dry_exchange = DryRunExchange(
+                dry_run_balance,
+                self.trades_dir,
+                latency=tuple(dry_run_latency),
+                drop_rate=dry_run_drop_rate,
+            )
+            logger.warning(
+                f"DRY RUN: no transactions are sent; virtual balance "
+                f"{dry_run_balance} SOL, landing delay {dry_run_latency} s, "
+                f"{dry_run_drop_rate:.0%} dropped; results in {self.trades_dir}/"
+            )
         self.priority_fee_manager = PriorityFeeManager(
             client=self.solana_client,
             enable_dynamic_fee=enable_dynamic_priority_fee,
@@ -261,6 +295,7 @@ class UniversalTrader:
                 quote_amounts=self.quote_amounts,
                 curve_refresh_budget=curve_refresh_budget,
                 trust_create_event=trust_create_event,
+                dry_run=self.dry_exchange,
             ),
             PlatformAwareSeller(
                 self.solana_client,
@@ -269,6 +304,7 @@ class UniversalTrader:
                 sell_slippage,
                 max_retries,
                 compute_units=self.compute_units,
+                dry_run=self.dry_exchange,
             ),
         )
 
@@ -314,8 +350,9 @@ class UniversalTrader:
         self.max_token_age = max_token_age
         self.token_wait_timeout = token_wait_timeout
 
-        # Cleanup parameters
-        self.cleanup_mode = cleanup_mode
+        # Cleanup parameters. A dry run opens no accounts, so there is nothing
+        # to close.
+        self.cleanup_mode = "disabled" if dry_run else cleanup_mode
         self.cleanup_force_close_with_burn = cleanup_force_close_with_burn
         self.cleanup_with_priority_fee = cleanup_with_priority_fee
 
@@ -580,8 +617,9 @@ class UniversalTrader:
             logger.debug(f"Token {token_info.symbol} already processed. Skipping...")
             return
 
-        # Record timestamp when token was discovered
-        self.token_timestamps[token_key] = monotonic()
+        # Record when the token was first discovered; a repeated event for it
+        # must not make it look fresher than it is.
+        self.token_timestamps.setdefault(token_key, monotonic())
 
         await self.token_queue.put(token_info)
         logger.info(
@@ -603,6 +641,11 @@ class UniversalTrader:
                 token_info = await self.token_queue.get()
                 took_item = True
                 token_key = str(token_info.mint)
+
+                # Listeners can report one creation twice, and both copies may be
+                # queued before either is processed: buy a coin once.
+                if token_key in self.processed_tokens:
+                    continue
 
                 # Check if token is still "fresh"
                 current_time = monotonic()
@@ -889,7 +932,7 @@ class UniversalTrader:
             f"recorded in trades/moonbags.jsonl"
         )
         try:
-            trades_dir = Path("trades")
+            trades_dir = self.trades_dir
             trades_dir.mkdir(exist_ok=True)
             with (trades_dir / "moonbags.jsonl").open("a", encoding="utf-8") as f:
                 f.write(json.dumps(entry) + "\n")
@@ -1380,7 +1423,7 @@ class UniversalTrader:
     async def _save_token_info(self, token_info: TokenInfo) -> None:
         """Save token information to a file."""
         try:
-            trades_dir = Path("trades")
+            trades_dir = self.trades_dir
             trades_dir.mkdir(exist_ok=True)
             file_path = trades_dir / f"{token_info.mint}.txt"
 
@@ -1426,7 +1469,7 @@ class UniversalTrader:
     ) -> None:
         """Log trade information."""
         try:
-            trades_dir = Path("trades")
+            trades_dir = self.trades_dir
             trades_dir.mkdir(exist_ok=True)
 
             log_entry = {
@@ -1438,6 +1481,7 @@ class UniversalTrader:
                 "price": price,
                 "amount": amount,
                 "tx_hash": str(tx_hash) if tx_hash else None,
+                "dry_run": self.dry_run,
             }
 
             log_file_path = trades_dir / "trades.log"

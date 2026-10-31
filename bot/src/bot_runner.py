@@ -122,6 +122,10 @@ async def start_bot(config_path: str):
                 "recover_timeout_action", "sell_all"
             ),
             max_open_positions=cfg["trade"].get("max_open_positions", 10),
+            dry_run=cfg["trade"].get("dry_run", False),
+            dry_run_balance=cfg["trade"].get("dry_run_balance", 0.2),
+            dry_run_latency=cfg["trade"].get("dry_run_latency", [1.0, 2.5]),
+            dry_run_drop_rate=cfg["trade"].get("dry_run_drop_rate", 0.05),
             # Listener configuration
             listener_type=cfg["filters"]["listener_type"],
             # Geyser configuration (if applicable)
