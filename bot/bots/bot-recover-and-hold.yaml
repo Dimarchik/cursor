@@ -36,7 +36,7 @@ trade:
   # транзакций. Приватный ключ не нужен (SOLANA_PRIVATE_KEY= можно оставить пустым).
   # Результаты — в trades_dryrun/. false = торговля реальными деньгами.
   dry_run: true
-  dry_run_balance: 0.2 # виртуальный стартовый баланс, SOL
+  dry_run_balance: 0.5 # виртуальный стартовый баланс, SOL
   dry_run_latency: [1.0, 2.5] # секунд от отправки до попадания в блок (без Jito)
   dry_run_drop_rate: 0.05 # доля транзакций, которые не попадут в блок
 
@@ -50,7 +50,7 @@ trade:
   recover_timeout_action: "sell_all" # "sell_all" или "hold" — что делать, если за max_hold_time цели нет
   max_hold_time: 1800 # секунд ждать цели (null — ждать бесконечно)
   stop_loss_percentage: null # например 0.5 — продать всё при падении на 50% до достижения цели
-  max_open_positions: 10 # сколько монет одновременно ждут цели; новые пропускаются, пока места нет
+  max_open_positions: 50 # сколько монет одновременно ждут цели; новые пропускаются, пока места нет
   price_check_interval: 2 # секунд между проверками цены каждой позиции
   max_exit_sell_attempts: 3
 

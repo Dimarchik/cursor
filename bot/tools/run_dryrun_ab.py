@@ -107,11 +107,14 @@ def main() -> None:
             time.sleep(args.minutes * 60)
         except KeyboardInterrupt:
             pass
+        # Stop the bots once; they record open positions as held on the way
+        # out. A second Ctrl+C must not cut the report off.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         for p in procs:
-            if p.pid:
+            if p.is_alive() and p.pid:
                 os.kill(p.pid, signal.SIGINT)
         for p in procs:
-            p.join(timeout=60)
+            p.join(timeout=90)
     report()
 
 

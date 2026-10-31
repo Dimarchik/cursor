@@ -379,6 +379,10 @@ class UniversalTrader:
         # buying new coins meanwhile.
         self._open_positions: dict[str, tuple[TokenInfo, Position]] = {}
         self._position_tasks: set[asyncio.Task] = set()
+        # Curve prices of open positions, read for all of them in one batched
+        # call per interval: pool -> (price, monotonic time read).
+        self._price_cache: dict[Pubkey, tuple[float, float]] = {}
+        self._price_poller: asyncio.Task | None = None
 
     async def _resolve_quote_token_programs(self) -> None:
         """Warm the quote-mint token-program and decimals caches at startup.
@@ -877,6 +881,10 @@ class UniversalTrader:
         if not self.yolo_mode:
             await monitor()
             return
+        if getattr(self, "_price_poller", None) is None and hasattr(
+            self.platform_implementations.curve_manager, "decode_pool_state"
+        ):
+            self._price_poller = asyncio.create_task(self._poll_prices())
         task = asyncio.create_task(monitor())
         self._position_tasks.add(task)
         task.add_done_callback(self._position_tasks.discard)
@@ -887,6 +895,8 @@ class UniversalTrader:
         Runs before post-session cleanup, which closes the accounts of every
         traded mint and, with `force_close_with_burn`, burns what they hold.
         """
+        if getattr(self, "_price_poller", None) is not None:
+            self._price_poller.cancel()
         # Snapshot first: a cancelled monitor drops its entry on the way out.
         open_positions = list(self._open_positions.values())
         for task in list(self._position_tasks):
@@ -1081,6 +1091,43 @@ class UniversalTrader:
         )
         return ExitSellVerdict.STOP
 
+    async def _poll_prices(self) -> None:
+        """Refresh `_price_cache` for every open position, once per interval.
+
+        One getMultipleAccounts call covers up to 100 curves, so the RPC load
+        stays flat however many positions are open; per-position monitors then
+        read the cache. Graduated or unreadable curves are left out and their
+        monitors read the price themselves.
+        """
+        decode = self.platform_implementations.curve_manager.decode_pool_state
+        while True:
+            pools = [
+                self._get_pool_address(info)
+                for info, position in list(self._open_positions.values())
+                if position.is_active and info.mint not in self._graduated_mints
+            ]
+            for i in range(0, len(pools), 100):
+                chunk = pools[i : i + 100]
+                try:
+                    accounts = await self.solana_client.get_multiple_accounts(chunk)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        f"Batched price read failed ({e}); monitors read directly"
+                    )
+                    break
+                now = monotonic()
+                for pool, account in zip(chunk, accounts, strict=False):
+                    try:
+                        state = decode(account.data) if account and account.data else {}
+                    except Exception:  # noqa: BLE001
+                        state = {}
+                    price = state.get("price_per_token")
+                    if price and price > 0 and not state.get("graduated"):
+                        self._price_cache[pool] = (price, now)
+                    else:
+                        self._price_cache.pop(pool, None)
+            await asyncio.sleep(self.price_check_interval)
+
     async def _read_price(self, token_info: TokenInfo) -> float:
         """The coin's price where it trades now: its curve, or after graduation its AMM pool.
 
@@ -1091,6 +1138,12 @@ class UniversalTrader:
             ValueError: If a graduated coin's pool cannot be priced yet — it
                 lands a moment after graduation
         """
+        cache = getattr(self, "_price_cache", None)
+        if cache:
+            hit = cache.get(self._get_pool_address(token_info))
+            # Two intervals: the poller may be mid-read when a monitor asks.
+            if hit and monotonic() - hit[1] <= 2 * self.price_check_interval:
+                return hit[0]
         implementations = self.platform_implementations
         try:
             return await implementations.curve_manager.calculate_price(

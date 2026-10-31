@@ -68,6 +68,14 @@ class PumpFunCurveManager(CurveManager):
             logger.exception("Failed to get curve state")
             raise ValueError(f"Invalid bonding curve state: {e!s}")
 
+    def decode_pool_state(self, data: bytes) -> dict[str, Any]:
+        """Decode raw bonding curve account data, for callers that batch their reads.
+
+        Same fields as `get_pool_state`; `price_per_token` is None for a
+        graduated curve.
+        """
+        return self._decode_curve_state_with_idl(data)
+
     async def get_pool_state_and_token_program(
         self, pool_address: Pubkey, mint: Pubkey, commitment: str | None = None
     ) -> tuple[dict[str, Any], Pubkey | None]:
