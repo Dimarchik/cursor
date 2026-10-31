@@ -13,7 +13,7 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 # Consecutive failures on the active endpoint before rotating to the next one.
-DEFAULT_FAILURE_THRESHOLD = 3
+DEFAULT_FAILURE_THRESHOLD = 2
 
 # How long a failed endpoint is skipped before it gets another chance. Short
 # enough that a transient blip recovers within a run, long enough that a
@@ -66,7 +66,9 @@ class EndpointRotator:
             cooldown_seconds: How long a failed endpoint is skipped.
         """
         self._endpoints = (
-            parse_endpoints(endpoints) if isinstance(endpoints, str) else list(endpoints)
+            parse_endpoints(endpoints)
+            if isinstance(endpoints, str)
+            else list(endpoints)
         )
         if not self._endpoints:
             raise ValueError("EndpointRotator requires at least one endpoint")
@@ -91,15 +93,19 @@ class EndpointRotator:
         """Reset the failure streak on the active endpoint."""
         self._consecutive_failures = 0
 
-    def mark_failure(self) -> bool:
+    def mark_failure(self, *, immediate: bool = False) -> bool:
         """Record a failure on the active endpoint, rotating if it crossed
         the threshold.
+
+        Args:
+            immediate: Rotate now regardless of the streak, for a refusal that
+                will repeat (a 429 rate limit).
 
         Returns:
             True if this call rotated to a different endpoint.
         """
         self._consecutive_failures += 1
-        if self._consecutive_failures < self._failure_threshold:
+        if not immediate and self._consecutive_failures < self._failure_threshold:
             return False
         if len(self._endpoints) < 2:
             # Nothing to rotate to -- keep counting so a caller that only

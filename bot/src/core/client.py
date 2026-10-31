@@ -3,8 +3,9 @@
 import asyncio
 import random
 import struct
+from collections.abc import Awaitable
 from time import monotonic
-from typing import Any
+from typing import Any, TypeVar
 
 import aiohttp
 from solana.rpc.async_api import AsyncClient
@@ -30,6 +31,27 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 HTTP_TOO_MANY_REQUESTS = 429
+
+T = TypeVar("T")
+
+
+def _is_rate_limited(error: BaseException) -> bool:
+    """Whether an exception, or one it wraps, is an HTTP 429.
+
+    solana-py wraps the httpx error, so the status sits on a cause in the chain.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        response = getattr(current, "response", None)
+        if getattr(response, "status_code", None) == HTTP_TOO_MANY_REQUESTS:
+            return True
+        if "429" in str(current) or "Too Many Requests" in str(current):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
 
 # Length of the `[instruction_index, error_detail]` pair inside
 # `{"InstructionError": [...]}` -- fixed by the RPC's `meta.err` shape.
@@ -305,7 +327,7 @@ class SolanaClient:
         kwargs: dict[str, Any] = {"encoding": "base64"}
         if commitment is not None:
             kwargs["commitment"] = commitment
-        response = await client.get_account_info(pubkey, **kwargs)
+        response = await self._reported(client.get_account_info(pubkey, **kwargs))
         if not response.value:
             raise ValueError(f"Account {pubkey} not found")
         return response.value
@@ -331,7 +353,7 @@ class SolanaClient:
         kwargs: dict[str, Any] = {"encoding": "base64"}
         if commitment is not None:
             kwargs["commitment"] = commitment
-        response = await client.get_multiple_accounts(pubkeys, **kwargs)
+        response = await self._reported(client.get_multiple_accounts(pubkeys, **kwargs))
         return list(response.value)
 
     async def get_token_account_balance(
@@ -351,8 +373,8 @@ class SolanaClient:
         """
         await self._rate_limiter.acquire()
         client = await self.get_client()
-        response = await client.get_token_account_balance(
-            token_account, commitment=commitment
+        response = await self._reported(
+            client.get_token_account_balance(token_account, commitment=commitment)
         )
         if response.value:
             return int(response.value.amount)
@@ -362,7 +384,9 @@ class SolanaClient:
         """Get the latest blockhash."""
         await self._rate_limiter.acquire()
         client = await self.get_client()
-        response = await client.get_latest_blockhash(commitment="processed")
+        response = await self._reported(
+            client.get_latest_blockhash(commitment="processed")
+        )
         return response.value.blockhash
 
     async def build_and_send_transaction(
@@ -813,16 +837,38 @@ class SolanaClient:
         if rotator is not None:
             rotator.mark_success()
 
-    def _note_rpc_failure(self) -> None:
+    def _note_rpc_failure(self, *, rate_limited: bool = False) -> bool:
         """Record a failure on the active endpoint, if a rotator exists.
 
         Rotating points `get_client`'s next call at the new endpoint via the
         mismatch check there; `post_rpc` talks to `aiohttp` directly, so
         nothing further needs resetting here.
+
+        Args:
+            rate_limited: The endpoint answered 429; it will keep refusing for
+                a while, so rotate now instead of waiting out the threshold.
+
+        Returns:
+            True if the next request goes to a different endpoint.
         """
         rotator = getattr(self, "_rotator", None)
-        if rotator is not None:
-            rotator.mark_failure()
+        if rotator is None:
+            return False
+        return rotator.mark_failure(immediate=rate_limited)
+
+    async def _reported(self, call: Awaitable[T]) -> T:
+        """Await a solana-py call, reporting its outcome to the rotator.
+
+        `post_rpc` reports its own outcomes; this covers the reads that go
+        through `AsyncClient` instead, the curve and balance reads among them.
+        """
+        try:
+            result = await call
+        except Exception as e:
+            self._note_rpc_failure(rate_limited=_is_rate_limited(e))
+            raise
+        self._note_rpc_success()
+        return result
 
     async def post_rpc(
         self,
@@ -875,6 +921,16 @@ class SolanaClient:
                 ) as response:
                     if response.status == HTTP_TOO_MANY_REQUESTS:
                         rate_limit_attempts += 1
+                        # With another endpoint to go to, waiting out this
+                        # one's limit only delays the answer.
+                        if rate_limit_attempts < max_429_retries and (
+                            self._note_rpc_failure(rate_limited=True)
+                        ):
+                            logger.warning(
+                                f"RPC rate limited (429) on {method}; "
+                                f"retrying on {self._active_endpoint()}"
+                            )
+                            continue
                         if rate_limit_attempts >= max_429_retries:
                             logger.error(
                                 f"RPC rate limited (429) on {method}, "
@@ -914,13 +970,16 @@ class SolanaClient:
             # crashed the caller with an exception whose str() is empty.
             except (TimeoutError, aiohttp.ClientError):
                 error_attempts += 1
-                self._note_rpc_failure()
+                rotated = self._note_rpc_failure()
                 if error_attempts >= max_retries:
                     logger.exception(
                         f"RPC request {method} failed after {max_retries} attempts"
                     )
                     break
 
+                if rotated:
+                    # A fresh endpoint needs no backoff.
+                    continue
                 wait_time = min(2 ** (error_attempts - 1), 16)
                 jitter = wait_time * random.uniform(0, 0.25)  # noqa: S311
                 logger.warning(

@@ -38,6 +38,7 @@ individual scripts for a subset.
 | `verify_recover_and_hold.py` | `recover_and_hold` sells back only the cost at the target, holds the rest out of cleanup's reach, sells everything on a stop loss or a `sell_all` timeout, and keeps open positions as held on shutdown |
 | `verify_time_exit_without_price.py` | `max_hold_time` still fires when every price read fails |
 | `verify_exit_sell_confirmation.py` | an exit sell is retried only when retrying is provably safe |
+| `verify_rpc_failover.py` | a 429 moves to the next endpoint at once and without back-off, other failures after two in a row, and the solana-py reads report to the rotator too |
 | `verify_rpc_deadline.py` | `post_rpc` bounds wall time, not just attempts (virtual clock) |
 | `verify_quote_decimals_resolved.py` | no trade path prices a coin before resolving its quote mint's decimals; nothing in `cookbook/` or `src/` falls back to a literal decimal count; both unit helpers raise for an unresolved mint; the two pre-seeded quote tables carry the same mints; the buy clears its quote gate before it sizes |
 | `verify_migration_event_discriminator.py` | the migration decoder rejects any payload that is not the wrapper program's `CreatePoolEvent`, including a foreign one long enough for the schema |
