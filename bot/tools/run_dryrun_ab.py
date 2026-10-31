@@ -93,9 +93,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--minutes", type=float, default=45)
     parser.add_argument("--report-only", action="store_true")
+    parser.add_argument(
+        "--configs", default=str(CONFIG_DIR), help="directory of dry-run configs"
+    )
     args = parser.parse_args()
     if not args.report_only:
-        configs = sorted(CONFIG_DIR.glob("*.yaml"))
+        configs = sorted(Path(args.configs).glob("*.yaml"))
         procs = [
             multiprocessing.Process(target=run_bot_process, args=(str(c),), name=c.stem)
             for c in configs
