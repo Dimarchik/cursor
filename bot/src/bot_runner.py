@@ -122,6 +122,9 @@ async def start_bot(config_path: str):
                 "recover_timeout_action", "sell_all"
             ),
             max_open_positions=cfg["trade"].get("max_open_positions", 10),
+            recover_sell_fraction=cfg["trade"].get("recover_sell_fraction"),
+            rest_hold_time=cfg["trade"].get("rest_hold_time"),
+            rest_take_profit_multiplier=cfg["trade"].get("rest_take_profit_multiplier"),
             dry_run=cfg["trade"].get("dry_run", False),
             dry_run_balance=cfg["trade"].get("dry_run_balance", 0.2),
             dry_run_latency=cfg["trade"].get("dry_run_latency", [1.0, 2.5]),

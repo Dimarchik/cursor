@@ -41,6 +41,10 @@ class Position:
     # covered by recover_buffer) and quote won back so far
     cost_quote: float = 0.0
     recovered_quote: float = 0.0
+    # Tokens bought, before any partial sell
+    initial_quantity: float = 0.0
+    # The cost is won back; what is left is the remainder being held or sold
+    recovered: bool = False
 
     # Status
     is_active: bool = True
@@ -91,6 +95,7 @@ class Position:
             stop_loss_price=stop_loss_price,
             max_hold_time=max_hold_time,
             cost_quote=entry_price * quantity,
+            initial_quantity=quantity,
         )
 
     def should_exit(self, current_price: float) -> tuple[bool, ExitReason | None]:

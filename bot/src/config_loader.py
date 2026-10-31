@@ -54,6 +54,27 @@ CONFIG_VALIDATION_RULES = [
         "trade.recover_buffer must be between 0 and 1",
     ),
     (
+        "trade.recover_sell_fraction",
+        (int, float),
+        0,
+        1,
+        "trade.recover_sell_fraction must be between 0 and 1",
+    ),
+    (
+        "trade.rest_hold_time",
+        int,
+        0,
+        float("inf"),
+        "trade.rest_hold_time must be a non-negative number of seconds",
+    ),
+    (
+        "trade.rest_take_profit_multiplier",
+        (int, float),
+        1.01,
+        float("inf"),
+        "trade.rest_take_profit_multiplier must be greater than 1",
+    ),
+    (
         "trade.max_open_positions",
         int,
         1,

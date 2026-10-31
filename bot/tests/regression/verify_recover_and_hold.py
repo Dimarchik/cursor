@@ -22,6 +22,10 @@ runs against a scripted price series and a stub seller:
   8. A recovery sell that fills below its trigger (the price moved while it
      landed) does not count as recovered: monitoring goes on, and the next
      time the target is reached the shortfall is sold.
+  9. With remainder rules the rest is sold too: `recover_sell_fraction`
+     sells that share at the target, then the remainder goes at
+     `rest_take_profit_multiplier` x entry or `rest_hold_time` seconds later,
+     emptying the account (cleanup runs, nothing is held).
   7. In yolo mode the position is monitored in the background, so the caller
      returns at once; shutdown cancels the monitor and records the position as
      held instead of leaving it to cleanup.
@@ -129,6 +133,7 @@ async def _run(
     position: Position,
     timeout_action: str = "sell_all",
     fills: list[float] | None = None,
+    rest: dict | None = None,
 ) -> tuple[StubSeller, UniversalTrader, list[str], list[dict]]:
     """Drive the real monitor loop in a scratch directory.
 
@@ -146,6 +151,8 @@ async def _run(
     trader.exit_strategy = "recover_and_hold"
     trader.recover_buffer = BUFFER
     trader.recover_timeout_action = timeout_action
+    for key, value in (rest or {}).items():
+        setattr(trader, key, value)
     token_info = _make_token_info()
     trader.traded_mints = {token_info.mint}
     trader._log_trade = lambda *_args, **_kwargs: None  # noqa: SLF001
@@ -381,6 +388,53 @@ async def check_short_fill_keeps_monitoring() -> bool:
     return ok
 
 
+async def check_remainder_rules() -> bool:
+    print("\n9. Remainder rules sell the rest")
+    target = ENTRY_PRICE * 2.0
+    position = _make_position()
+    seller, _, cleaned, bags = await _run(
+        [target, ENTRY_PRICE * 3.0, ENTRY_PRICE * 4.5],
+        position,
+        rest={
+            "recover_sell_fraction": 0.75,
+            "rest_hold_time": None,
+            "rest_take_profit_multiplier": 4.0,
+        },
+    )
+    amounts = [a for a, _ in seller.sells]
+    ok = _check(
+        "75% at the target, the rest at 4x",
+        len(amounts) == 2
+        and abs(amounts[0] - 0.75 * QUANTITY) < TOLERANCE
+        and abs(amounts[1] - 0.25 * QUANTITY) < TOLERANCE
+        and seller.sells[1][1] == ENTRY_PRICE * 4.5,
+        f"{seller.sells}",
+    )
+    ok &= _check(
+        "position closed and cleaned up",
+        not position.is_active and cleaned == [str(Pubkey.default())],
+        f"{cleaned}",
+    )
+    ok &= _check("nothing held", not bags, f"{bags}")
+
+    position = _make_position()
+    seller, _, cleaned, bags = await _run(
+        [target, ENTRY_PRICE * 1.5],
+        position,
+        rest={
+            "recover_sell_fraction": None,
+            "rest_hold_time": 0,
+            "rest_take_profit_multiplier": None,
+        },
+    )
+    ok &= _check(
+        "rest_hold_time 0 sells the rest right after",
+        len(seller.sells) == 2 and not position.is_active and not bags,
+        f"{[round(a) for a, _ in seller.sells]}",
+    )
+    return ok
+
+
 async def main() -> None:
     results = [
         check_recover_quantity(),
@@ -390,6 +444,7 @@ async def main() -> None:
         check_shipped_config(),
         await check_background_monitor_and_shutdown(),
         await check_short_fill_keeps_monitoring(),
+        await check_remainder_rules(),
     ]
     print(f"\n{'ALL PASSED' if all(results) else 'FAILED'}")
     sys.exit(0 if all(results) else 1)

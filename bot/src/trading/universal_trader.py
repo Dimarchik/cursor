@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import math
 import sys
 from datetime import datetime
 from enum import Enum
@@ -78,6 +79,8 @@ class ExitSellVerdict(Enum):
     """
 
     SOLD = "sold"  # confirmed on this attempt, the ordinary happy path
+    # recover_and_hold: the cost is back and the remainder is still watched
+    CONTINUE = "continue"
     LATE_SUCCESS = "late_success"  # it landed after all — stop, do not resell
     RETRY = "retry"  # provably nothing happened on chain
     STOP = "stop"  # still unknown — a blind resell is the worse risk
@@ -180,6 +183,9 @@ class UniversalTrader:
         recover_buffer: float = 0.05,
         recover_timeout_action: str = "sell_all",
         max_open_positions: int = 10,
+        recover_sell_fraction: float | None = None,
+        rest_hold_time: int | None = None,
+        rest_take_profit_multiplier: float | None = None,
         # Dry run: trade against live prices without sending transactions
         dry_run: bool = False,
         dry_run_balance: float = 0.2,
@@ -344,6 +350,14 @@ class UniversalTrader:
         self.recover_buffer = recover_buffer
         self.recover_timeout_action = recover_timeout_action
         self.max_open_positions = max(1, max_open_positions)
+        # Share of the bought tokens to sell at the target, if more than the
+        # cost needs (None: just the cost plus recover_buffer).
+        self.recover_sell_fraction = recover_sell_fraction
+        # What happens to the remainder once the cost is back: sold
+        # `rest_hold_time` seconds later and/or at `rest_take_profit_multiplier`
+        # x entry. With neither it is held indefinitely.
+        self.rest_hold_time = rest_hold_time
+        self.rest_take_profit_multiplier = rest_take_profit_multiplier
 
         # Timing parameters
         self.wait_time_after_creation = wait_time_after_creation
@@ -786,6 +800,8 @@ class UniversalTrader:
             buy_result.tx_signature,
         )
         self.traded_mints.add(token_info.mint)
+        if self.dry_run:
+            await self._record_entry(token_info, buy_result)
         # Track token program for cleanup
         mint_str = str(token_info.mint)
         if token_info.token_program_id:
@@ -1138,6 +1154,48 @@ class UniversalTrader:
                 self._record_price_path(open_now)
             await asyncio.sleep(self.price_check_interval)
 
+    async def _record_entry(
+        self, token_info: TokenInfo, buy_result: TradeResult
+    ) -> None:
+        """Append what was knowable at entry to `<trades_dir>/entries.jsonl`.
+
+        Joined later with trades.log and prices.jsonl, this labels each entry
+        with how it went, to find which launch signals pick winners. Costs one
+        curve read, so only dry runs do it.
+        """
+        mint = str(token_info.mint)
+        discovered = self.token_timestamps.get(mint)
+        entry = {
+            "t": round(datetime.utcnow().timestamp(), 1),
+            "mint": mint,
+            "symbol": token_info.symbol,
+            "name": token_info.name,
+            "uri": token_info.uri,
+            "creator": str(token_info.creator) if token_info.creator else None,
+            "is_mayhem_mode": token_info.is_mayhem_mode,
+            "is_cashback_coin": token_info.is_cashback_coin,
+            "seconds_since_detection": (
+                round(monotonic() - discovered, 2) if discovered is not None else None
+            ),
+            "entry_price": buy_result.price,
+            "tokens": buy_result.amount,
+        }
+        try:
+            state = await self.platform_implementations.curve_manager.get_pool_state(
+                self._get_pool_address(token_info)
+            )
+            entry["real_sol_reserves"] = state.get("real_sol_reserves")
+            entry["virtual_sol_reserves"] = state.get("virtual_sol_reserves")
+            entry["virtual_token_reserves"] = state.get("virtual_token_reserves")
+        except Exception as e:  # noqa: BLE001
+            entry["curve_error"] = str(e)[:120]
+        try:
+            self.trades_dir.mkdir(parents=True, exist_ok=True)
+            with (self.trades_dir / "entries.jsonl").open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+        except OSError:
+            logger.exception("Failed to record entry")
+
     def _record_price_path(self, open_now: list[tuple[TokenInfo, Position]]) -> None:
         """Append each open position's price / entry to `<trades_dir>/prices.jsonl`.
 
@@ -1349,6 +1407,7 @@ class UniversalTrader:
             self.exit_strategy == "recover_and_hold"
             and exit_reason is ExitReason.MAX_HOLD_TIME
             and self.recover_timeout_action == "hold"
+            and not position.recovered
         ):
             self._record_bag(token_info, position, "timeout_hold", None)
             position.close_position(price, exit_reason)
@@ -1357,6 +1416,8 @@ class UniversalTrader:
         verdict = await self._attempt_position_exit(
             token_info, position, exit_reason, price
         )
+        if verdict is ExitSellVerdict.CONTINUE:
+            return False
         if verdict is not ExitSellVerdict.RETRY:
             return True
 
@@ -1402,8 +1463,15 @@ class UniversalTrader:
         if (
             self.exit_strategy == "recover_and_hold"
             and exit_reason is ExitReason.TAKE_PROFIT
+            and not position.recovered
         ):
             sell_amount = position.recover_quantity(price, self.recover_buffer)
+            fraction = getattr(self, "recover_sell_fraction", None)
+            if fraction:
+                sell_amount = min(
+                    position.quantity,
+                    max(sell_amount, fraction * position.initial_quantity),
+                )
         partial = sell_amount < position.quantity
         if partial:
             logger.info(
@@ -1493,6 +1561,26 @@ class UniversalTrader:
         """
         position.quantity -= sold
         position.recovered_quote += sold * price
+        if position.recovered_quote >= position.cost_quote * 0.999 and (
+            getattr(self, "rest_hold_time", None) is not None
+            or getattr(self, "rest_take_profit_multiplier", None)
+        ):
+            self._watch_remainder(position)
+            logger.info(
+                f"Recovered cost of {token_info.symbol}; selling the remaining "
+                f"{position.quantity:.6f} tokens "
+                + (
+                    f"at {self.rest_take_profit_multiplier}x entry "
+                    if self.rest_take_profit_multiplier
+                    else ""
+                )
+                + (
+                    f"or after {self.rest_hold_time}s"
+                    if self.rest_hold_time is not None
+                    else ""
+                )
+            )
+            return ExitSellVerdict.CONTINUE
         if position.recovered_quote >= position.cost_quote * 0.999:
             self._record_bag(token_info, position, "recovered", price)
             position.close_position(price, ExitReason.RECOVERED)
@@ -1508,6 +1596,25 @@ class UniversalTrader:
             f"{position.cost_quote:.6f} back; still monitoring"
         )
         return ExitSellVerdict.RETRY
+
+    def _watch_remainder(self, position: Position) -> None:
+        """Re-arm a recovered position's exits for its remainder.
+
+        The next take-profit or time exit sells everything left, and a sell
+        that empties the account lets cleanup reclaim its rent.
+        """
+        position.recovered = True
+        multiplier = self.rest_take_profit_multiplier
+        position.take_profit_price = (
+            position.entry_price * multiplier if multiplier else None
+        )
+        position.stop_loss_price = None
+        if self.rest_hold_time is not None:
+            held = (datetime.utcnow() - position.entry_time).total_seconds()
+            # Rounded up: a max_hold_time of 0 reads as "no limit".
+            position.max_hold_time = math.ceil(held) + self.rest_hold_time
+        else:
+            position.max_hold_time = None
 
     async def _cleanup_after_exit(self, token_info: TokenInfo) -> None:
         """Run the configured post-sell cleanup for a closed position.
