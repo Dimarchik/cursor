@@ -14,8 +14,10 @@ Offline machine checks, no network and no funds moved:
      waiting.
   3. A solana-py read that fails with a wrapped 429 rotates the client, and
      the next `AsyncClient` is built for the new endpoint.
-  4. A failed read whose error is not a rate limit counts toward the streak
+  4. A failed read whose error is not a refusal counts toward the streak
      instead of rotating at once.
+  5. A 403 (an endpoint that does not serve the method) rotates at once even
+     when other requests to it succeed in between.
 
 Usage:
     uv run tests/regression/verify_rpc_failover.py
@@ -29,7 +31,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from core.client import SolanaClient, _is_rate_limited  # noqa: E402
+from core.client import SolanaClient, _is_refusal  # noqa: E402
 from core.endpoint_rotator import EndpointRotator  # noqa: E402
 
 A, B, C = "https://a.example", "https://b.example", "https://c.example"
@@ -164,10 +166,33 @@ async def check_reported_reads() -> bool:
     )
     ok &= _check(
         "a plain error is not a rate limit",
-        _is_rate_limited(RuntimeError("connection reset")) is False,
+        _is_refusal(RuntimeError("connection reset")) is False,
         "not rate limited",
     )
     await built.close()
+
+    print("\n5. A method the endpoint refuses (403)")
+    client = _client([A, B])
+
+    async def forbidden() -> None:
+        try:
+            raise _HTTPError(403)
+        except _HTTPError as inner:
+            raise RuntimeError("GetMultipleAccounts") from inner
+
+    async def fine() -> str:
+        return "ok"
+
+    for call in (fine, forbidden):
+        try:
+            await client._reported(call())  # noqa: SLF001
+        except RuntimeError:
+            pass
+    ok &= _check(
+        "rotated despite a success before it",
+        client._rotator.current == B,  # noqa: SLF001
+        client._rotator.current,  # noqa: SLF001
+    )
     return ok
 
 

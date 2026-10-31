@@ -35,8 +35,14 @@ HTTP_TOO_MANY_REQUESTS = 429
 T = TypeVar("T")
 
 
-def _is_rate_limited(error: BaseException) -> bool:
-    """Whether an exception, or one it wraps, is an HTTP 429.
+HTTP_FORBIDDEN = 403
+# Answers an endpoint will repeat however often it is asked: a rate limit, or a
+# method the endpoint does not serve (PublicNode refuses getMultipleAccounts).
+REFUSALS = (HTTP_TOO_MANY_REQUESTS, HTTP_FORBIDDEN)
+
+
+def _is_refusal(error: BaseException) -> bool:
+    """Whether an exception, or one it wraps, is an HTTP 429 or 403.
 
     solana-py wraps the httpx error, so the status sits on a cause in the chain.
     """
@@ -45,9 +51,14 @@ def _is_rate_limited(error: BaseException) -> bool:
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         response = getattr(current, "response", None)
-        if getattr(response, "status_code", None) == HTTP_TOO_MANY_REQUESTS:
+        if getattr(response, "status_code", None) in REFUSALS:
             return True
-        if "429" in str(current) or "Too Many Requests" in str(current):
+        if getattr(current, "status", None) in REFUSALS:  # aiohttp
+            return True
+        text = str(current)
+        if any(
+            marker in text for marker in ("429", "Too Many Requests", "403 Forbidden")
+        ):
             return True
         current = current.__cause__ or current.__context__
     return False
@@ -837,7 +848,7 @@ class SolanaClient:
         if rotator is not None:
             rotator.mark_success()
 
-    def _note_rpc_failure(self, *, rate_limited: bool = False) -> bool:
+    def _note_rpc_failure(self, *, refused: bool = False) -> bool:
         """Record a failure on the active endpoint, if a rotator exists.
 
         Rotating points `get_client`'s next call at the new endpoint via the
@@ -845,8 +856,10 @@ class SolanaClient:
         nothing further needs resetting here.
 
         Args:
-            rate_limited: The endpoint answered 429; it will keep refusing for
-                a while, so rotate now instead of waiting out the threshold.
+            refused: The endpoint answered 429 or 403; it will keep refusing
+                this request, so rotate now instead of waiting out the
+                threshold. Successful requests of other kinds in between would
+                otherwise reset the streak and pin a refusing endpoint.
 
         Returns:
             True if the next request goes to a different endpoint.
@@ -854,7 +867,7 @@ class SolanaClient:
         rotator = getattr(self, "_rotator", None)
         if rotator is None:
             return False
-        return rotator.mark_failure(immediate=rate_limited)
+        return rotator.mark_failure(immediate=refused)
 
     async def _reported(self, call: Awaitable[T]) -> T:
         """Await a solana-py call, reporting its outcome to the rotator.
@@ -865,7 +878,7 @@ class SolanaClient:
         try:
             result = await call
         except Exception as e:
-            self._note_rpc_failure(rate_limited=_is_rate_limited(e))
+            self._note_rpc_failure(refused=_is_refusal(e))
             raise
         self._note_rpc_success()
         return result
@@ -924,7 +937,7 @@ class SolanaClient:
                         # With another endpoint to go to, waiting out this
                         # one's limit only delays the answer.
                         if rate_limit_attempts < max_429_retries and (
-                            self._note_rpc_failure(rate_limited=True)
+                            self._note_rpc_failure(refused=True)
                         ):
                             logger.warning(
                                 f"RPC rate limited (429) on {method}; "
@@ -968,9 +981,9 @@ class SolanaClient:
             # timeout fires, and it is not an aiohttp.ClientError — without it
             # here every RPC timeout propagated out of post_rpc unretried and
             # crashed the caller with an exception whose str() is empty.
-            except (TimeoutError, aiohttp.ClientError):
+            except (TimeoutError, aiohttp.ClientError) as e:
                 error_attempts += 1
-                rotated = self._note_rpc_failure()
+                rotated = self._note_rpc_failure(refused=_is_refusal(e))
                 if error_attempts >= max_retries:
                     logger.exception(
                         f"RPC request {method} failed after {max_retries} attempts"
