@@ -206,7 +206,12 @@ def main() -> None:
 
     rows = []
     for i, c in enumerate(coins, 1):
-        f = cached(DATA / "facts" / f"{c['sig']}.json", lambda c=c: create_facts(c["sig"], c["mint"]))
+        try:
+            f = cached(DATA / "facts" / f"{c['sig']}.json", lambda c=c: create_facts(c["sig"], c["mint"]))
+        except (RuntimeError, TypeError, KeyError) as e:
+            # Every endpoint refused the transaction, or it came back empty.
+            print(f"  skipped {c['sig'][:12]}: {e}")
+            continue
         hit, pnl = outcome(c, (prices.get(c["mint"]) or 0) / sol)
         rows.append({"t": c["t"], "hit": hit, "pnl": pnl, "s": signals(f, flags.get(c["sig"], {}), c["t"])})
         if i % 200 == 0:
