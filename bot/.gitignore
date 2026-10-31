@@ -174,3 +174,6 @@ cython_debug/
 trades/trades.log
 # Mac OS X
 .DS_Store
+# tools/backtest_24h.py raw cache; report.json is kept
+analysis_data/*
+!analysis_data/report.json
