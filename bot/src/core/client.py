@@ -20,6 +20,7 @@ from solders.pubkey import Pubkey
 from solders.signature import Signature
 from solders.transaction import VersionedTransaction
 
+from core.endpoint_rotator import EndpointRotator
 from core.pubkeys import is_sol_paired
 from core.rpc_rate_limiter import TokenBucketRateLimiter
 from interfaces.core import ConfirmationStatus, Platform
@@ -179,10 +180,15 @@ class SolanaClient:
         """Initialize Solana client with RPC endpoint.
 
         Args:
-            rpc_endpoint: URL of the Solana RPC endpoint
+            rpc_endpoint: URL of the Solana RPC endpoint. May be several
+                comma-separated URLs; a request-level failure streak then
+                rotates to the next one instead of grinding on a dead or
+                rate-limited free-tier node. A single URL behaves exactly as
+                before -- the rotator never has anywhere else to go.
             max_rps: Maximum RPC requests per second (rate limiter)
         """
-        self.rpc_endpoint = rpc_endpoint
+        self._rotator = EndpointRotator(rpc_endpoint)
+        self.rpc_endpoint = self._rotator.current
         self._client = None
         self._cached_blockhash: Hash | None = None
         self._blockhash_lock = asyncio.Lock()
@@ -194,14 +200,22 @@ class SolanaClient:
         self._session_lock = asyncio.Lock()
 
     async def start_blockhash_updater(self, interval: float = 5.0):
-        """Start background task to update recent blockhash."""
+        """Start background task to update recent blockhash.
+
+        Runs forever at a fixed interval, so a free-tier endpoint that starts
+        erroring or rate-limiting shows up here first and most often. Counted
+        against the rotator independently of `post_rpc`'s own counting, since
+        this path goes through `solana-py`'s client, not `post_rpc`.
+        """
         while True:
             try:
                 blockhash = await self.get_latest_blockhash()
                 async with self._blockhash_lock:
                     self._cached_blockhash = blockhash
+                self._note_rpc_success()
             except Exception as e:
                 logger.warning(f"Blockhash fetch failed: {e!s}")
+                self._note_rpc_failure()
             finally:
                 await asyncio.sleep(interval)
 
@@ -213,8 +227,15 @@ class SolanaClient:
             return self._cached_blockhash
 
     async def get_client(self) -> AsyncClient:
-        """Get or create the AsyncClient instance."""
-        if self._client is None:
+        """Get or create the AsyncClient instance.
+
+        Rebuilds the client whenever the rotator has moved to a different
+        endpoint than the one the cached `AsyncClient` was built against --
+        `solana.rpc.async_api.AsyncClient` binds its endpoint at construction
+        and has no way to repoint it.
+        """
+        if self._client is None or self.rpc_endpoint != self._rotator.current:
+            self.rpc_endpoint = self._rotator.current
             self._client = AsyncClient(self.rpc_endpoint)
         return self._client
 
@@ -770,6 +791,36 @@ class SolanaClient:
 
             await asyncio.sleep(TX_RESULT_RETRY_DELAY)
 
+    def _active_endpoint(self) -> str:
+        """Read the endpoint to use for the next request.
+
+        Falls back to `self.rpc_endpoint` when no rotator is attached, which
+        is what the regression tests get by building a `SolanaClient` with
+        `object.__new__` and setting `rpc_endpoint` directly.
+        """
+        rotator = getattr(self, "_rotator", None)
+        if rotator is None:
+            return self.rpc_endpoint
+        self.rpc_endpoint = rotator.current
+        return self.rpc_endpoint
+
+    def _note_rpc_success(self) -> None:
+        """Clear the active endpoint's failure streak, if a rotator exists."""
+        rotator = getattr(self, "_rotator", None)
+        if rotator is not None:
+            rotator.mark_success()
+
+    def _note_rpc_failure(self) -> None:
+        """Record a failure on the active endpoint, if a rotator exists.
+
+        Rotating points `get_client`'s next call at the new endpoint via the
+        mismatch check there; `post_rpc` talks to `aiohttp` directly, so
+        nothing further needs resetting here.
+        """
+        rotator = getattr(self, "_rotator", None)
+        if rotator is not None:
+            rotator.mark_failure()
+
     async def post_rpc(
         self,
         body: dict[str, Any],
@@ -783,6 +834,11 @@ class SolanaClient:
         retry schedule alone can keep one call going for minutes — three error
         retries backing off 1, 2, 4 ... 16s, or ten 429 retries waiting up to 30s
         each and honouring a `Retry-After` header of any size.
+
+        When the client was built with several comma-separated endpoints, a
+        failure streak (timeouts/errors, or exhausted 429 retries) rotates to
+        the next endpoint; the very next attempt in this same call already
+        goes out against the new one.
 
         Args:
             body: JSON-RPC request body.
@@ -808,9 +864,10 @@ class SolanaClient:
             try:
                 await self._rate_limiter.acquire()
                 session = await self._get_session()
+                endpoint = self._active_endpoint()
 
                 async with session.post(
-                    self.rpc_endpoint,
+                    endpoint,
                     json=body,
                 ) as response:
                     if response.status == HTTP_TOO_MANY_REQUESTS:
@@ -820,6 +877,7 @@ class SolanaClient:
                                 f"RPC rate limited (429) on {method}, "
                                 f"exhausted {max_429_retries} rate-limit retries"
                             )
+                            self._note_rpc_failure()
                             break
                         total_wait = _retry_after_seconds(
                             response.headers.get("Retry-After"), rate_limit_attempts
@@ -834,11 +892,13 @@ class SolanaClient:
                                 f"RPC request {method} gave up on its {deadline} "
                                 f"(next retry would wait {total_wait:.1f}s)"
                             )
+                            self._note_rpc_failure()
                             break
                         await asyncio.sleep(total_wait)
                         continue
 
                     response.raise_for_status()
+                    self._note_rpc_success()
                     return await response.json()
 
             except aiohttp.ContentTypeError:
@@ -851,6 +911,7 @@ class SolanaClient:
             # crashed the caller with an exception whose str() is empty.
             except (TimeoutError, aiohttp.ClientError):
                 error_attempts += 1
+                self._note_rpc_failure()
                 if error_attempts >= max_retries:
                     logger.exception(
                         f"RPC request {method} failed after {max_retries} attempts"

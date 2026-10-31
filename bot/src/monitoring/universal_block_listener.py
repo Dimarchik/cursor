@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 import websockets
 
 from core.client import SolanaClient
+from core.endpoint_rotator import EndpointRotator
 from interfaces.core import Platform, TokenInfo
 from monitoring.base_listener import BaseTokenListener, reraise_if_cancelled
 from platforms import get_platform_implementations, platform_factory
@@ -32,11 +33,14 @@ class UniversalBlockListener(BaseTokenListener):
         """Initialize universal block listener.
 
         Args:
-            wss_endpoint: WebSocket endpoint URL
+            wss_endpoint: WebSocket endpoint URL, or several comma-separated
+                URLs. On a connection failure the listener rotates to the next
+                one rather than retrying the same dead/rate-limited endpoint.
             platforms: List of platforms to monitor (if None, monitor all supported platforms)
         """
         super().__init__()
-        self.wss_endpoint = wss_endpoint
+        self._endpoint_rotator = EndpointRotator(wss_endpoint)
+        self.wss_endpoint = self._endpoint_rotator.current
         self.ping_interval = 20  # seconds
 
         # Get supported platforms
@@ -104,10 +108,12 @@ class UniversalBlockListener(BaseTokenListener):
 
         while True:
             try:
+                self.wss_endpoint = self._endpoint_rotator.current
                 async with websockets.connect(
                     self.wss_endpoint, max_size=WEBSOCKET_MAX_MESSAGE_BYTES
                 ) as websocket:
                     await self._subscribe_to_programs(websocket)
+                    self._endpoint_rotator.mark_success()
                     ping_task = asyncio.create_task(self._ping_loop(websocket))
 
                     try:
@@ -152,6 +158,7 @@ class UniversalBlockListener(BaseTokenListener):
 
             except Exception:
                 logger.exception("WebSocket connection error")
+                self._endpoint_rotator.mark_failure()
                 logger.info("Reconnecting in 5 seconds...")
                 await asyncio.sleep(5)
 
