@@ -931,7 +931,7 @@ class UniversalTrader:
         }
         logger.info(
             f"Holding {position.quantity:.6f} {token_info.symbol} ({reason}); "
-            f"recorded in trades/moonbags.jsonl"
+            f"recorded in {self.trades_dir}/moonbags.jsonl"
         )
         try:
             trades_dir = self.trades_dir
