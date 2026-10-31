@@ -126,6 +126,9 @@ async def start_bot(config_path: str):
             dry_run_balance=cfg["trade"].get("dry_run_balance", 0.2),
             dry_run_latency=cfg["trade"].get("dry_run_latency", [1.0, 2.5]),
             dry_run_drop_rate=cfg["trade"].get("dry_run_drop_rate", 0.05),
+            # One directory per bot, so dry runs of several configs side by
+            # side keep separate books.
+            dry_run_dir=f"trades_dryrun/{cfg['name']}",
             # Listener configuration
             listener_type=cfg["filters"]["listener_type"],
             # Geyser configuration (if applicable)

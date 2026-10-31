@@ -240,7 +240,7 @@ class DryRunExchange:
             "drop_rate": self.drop_rate,
         }
         try:
-            self.path.parent.mkdir(exist_ok=True)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(json.dumps(summary, indent=2))
         except OSError:
             logger.exception("Failed to save dry-run summary")

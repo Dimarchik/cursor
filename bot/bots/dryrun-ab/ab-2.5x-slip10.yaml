@@ -1,0 +1,97 @@
+# A/B dry run: цель 2.5x, проскальзывание продажи 10%.
+# Запуск всех вариантов разом: uv run tools/run_dryrun_ab.py
+# Стратегия «вернуть вложенное и держать остаток» (recover_and_hold).
+#
+# 1. Бот ловит новую монету на pump.fun и покупает её на buy_amount SOL.
+# 2. Ждёт, пока цена вырастет в recover_multiplier раз (по умолчанию 2x).
+# 3. Продаёт ровно столько, чтобы вернуть вложенное + recover_buffer на комиссии
+#    (на 2x это ~52% позиции), остальное держит и больше не трогает.
+# 4. Монеты в холде записываются в trades/moonbags.jsonl;
+#    посмотреть их текущую стоимость: uv run tools/moonbags.py
+#
+# Если за max_hold_time секунд цель не достигнута, recover_timeout_action решает:
+#   "sell_all" — продать всё и закрыть токен-аккаунт (вернётся депозит ~0.002 SOL)
+#   "hold"     — оставить всё как есть в холде
+
+name: "ab-2.5x-slip10"
+env_file: ".env"
+rpc_endpoint: "${SOLANA_NODE_RPC_ENDPOINT}"
+wss_endpoint: "${SOLANA_NODE_WSS_ENDPOINT}"
+private_key: "${SOLANA_PRIVATE_KEY}"
+
+enabled: true
+separate_process: true
+
+platform: "pump_fun"
+
+geyser:
+  endpoint: "${GEYSER_ENDPOINT}"
+  api_token: "${GEYSER_API_TOKEN}"
+  auth_type: "basic"
+
+trade:
+  # DRY RUN: бот ловит настоящие монеты и читает настоящие цены, но транзакции
+  # НЕ отправляет. Каждая сделка «приземляется» через dry_run_latency секунд и
+  # исполняется по кривой pump.fun в том состоянии, в каком она будет к этому
+  # моменту, с учётом размера сделки, проскальзывания (откат, если цена ушла
+  # дальше buy_slippage/sell_slippage), комиссий, залога за аккаунт и потерянных
+  # транзакций. Приватный ключ не нужен (SOLANA_PRIVATE_KEY= можно оставить пустым).
+  # Результаты — в trades_dryrun/. false = торговля реальными деньгами.
+  dry_run: true
+  dry_run_balance: 0.2 # виртуальный стартовый баланс, SOL
+  dry_run_latency: [1.0, 2.5] # секунд от отправки до попадания в блок (без Jito)
+  dry_run_drop_rate: 0.05 # доля транзакций, которые не попадут в блок
+
+  buy_amount: 0.005 # SOL на одну монету (~$0.5 при SOL ≈ $100)
+  buy_slippage: 0.3
+  sell_slippage: 0.1
+
+  exit_strategy: "recover_and_hold"
+  recover_multiplier: 2.5 # при каком росте цены возвращать вложенное
+  recover_buffer: 0.1 # продать на 5% больше безубытка: комиссии pump.fun с обеих сторон, сеть, проскальзывание
+  recover_timeout_action: "sell_all" # "sell_all" или "hold" — что делать, если за max_hold_time цели нет
+  max_hold_time: 1800 # секунд ждать цели (null — ждать бесконечно)
+  stop_loss_percentage: null # например 0.5 — продать всё при падении на 50% до достижения цели
+  max_open_positions: 8 # сколько монет одновременно ждут цели; новые пропускаются, пока места нет
+  price_check_interval: 3 # секунд между проверками цены каждой позиции
+  max_exit_sell_attempts: 3
+
+  # false: бот покупает ровно на buy_amount SOL, сначала прочитав цену.
+  # true: быстрее, но покупает фиксированное число токенов (extreme_fast_token_amount).
+  extreme_fast_mode: false
+  extreme_fast_token_amount: 20
+  curve_refresh_budget: 2.0
+  trust_create_event: true
+
+priority_fees:
+  enable_dynamic: false
+  enable_fixed: true
+  fixed_amount: 200_000 # microlamports за CU
+  extra_percentage: 0.0
+  hard_cap: 200_000
+
+compute_units: {}
+
+filters:
+  match_string: null
+  bro_address: null
+  listener_type: "logs" # "geyser" быстрее, если у провайдера есть Geyser
+  max_token_age: 5 # секунд: монеты старше в очереди пропускаются
+  marry_mode: false
+  yolo_mode: true # торговать непрерывно, а не одну монету
+
+retries:
+  max_attempts: 1
+  wait_after_creation: 1 # секунд после создания монеты перед покупкой (без extreme_fast_mode)
+  wait_after_buy: 15
+  wait_before_new_token: 5 # пауза между покупками
+
+cleanup:
+  # after_sell: после полной продажи закрыть аккаунт и вернуть депозит.
+  # Аккаунты монет в холде не трогаются никогда.
+  mode: "after_sell"
+  force_close_with_burn: false
+  with_priority_fee: false
+
+node:
+  max_rps: 25

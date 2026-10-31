@@ -185,6 +185,7 @@ class UniversalTrader:
         dry_run_balance: float = 0.2,
         dry_run_latency: tuple[float, float] = (1.0, 2.5),
         dry_run_drop_rate: float = 0.05,
+        dry_run_dir: str = "trades_dryrun",
         # Priority fee configuration
         enable_dynamic_priority_fee: bool = False,
         enable_fixed_priority_fee: bool = True,
@@ -227,7 +228,7 @@ class UniversalTrader:
         self.wallet = Wallet(private_key)
         self.dry_exchange = None
         if dry_run:
-            self.trades_dir = Path("trades_dryrun")
+            self.trades_dir = Path(dry_run_dir)
             self.dry_exchange = DryRunExchange(
                 dry_run_balance,
                 self.trades_dir,
@@ -933,7 +934,7 @@ class UniversalTrader:
         )
         try:
             trades_dir = self.trades_dir
-            trades_dir.mkdir(exist_ok=True)
+            trades_dir.mkdir(parents=True, exist_ok=True)
             with (trades_dir / "moonbags.jsonl").open("a", encoding="utf-8") as f:
                 f.write(json.dumps(entry) + "\n")
         except OSError:
@@ -1446,7 +1447,7 @@ class UniversalTrader:
         """Save token information to a file."""
         try:
             trades_dir = self.trades_dir
-            trades_dir.mkdir(exist_ok=True)
+            trades_dir.mkdir(parents=True, exist_ok=True)
             file_path = trades_dir / f"{token_info.mint}.txt"
 
             # Convert to dictionary for saving - platform-agnostic
@@ -1492,7 +1493,7 @@ class UniversalTrader:
         """Log trade information."""
         try:
             trades_dir = self.trades_dir
-            trades_dir.mkdir(exist_ok=True)
+            trades_dir.mkdir(parents=True, exist_ok=True)
 
             log_entry = {
                 "timestamp": datetime.utcnow().isoformat(),
